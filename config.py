@@ -30,40 +30,47 @@ class BotConfig:
 	supported_tokens: list[
 	    str] = None  # List of tokens to track (e.g., ["BTC", "ETH", "SOL", "XRP"])
 
-	# Strategy Parameters - Arbitrage Detection
-	# ═══════════════════════════════════════════════════════════════════════
-	# CRITICAL: The bot ONLY enters if UP + DOWN <= complete_threshold
-	# This ensures arbitrage profit is possible BEFORE buying the first leg.
+	# Strategy Parameters - Arbitrage Detection (MODO PRODUCCIÓN/SNIPER)
 	# ═══════════════════════════════════════════════════════════════════════
 
 	# Step 1: Entry conditions
-	first_leg_threshold: float = 0.30  # Buy UP or DOWN when price <= this
-	min_spread_to_enter: float = 0.40  # Minimum spread to consider entry
-	min_safe_price: float = 0.15  # Don't buy below this (market already decided winner)
+	# Volvemos a 0.25 para asegurar que compramos gangas y tenemos margen de caída
+	first_leg_threshold: float = 0.25
+	min_spread_to_enter: float = 0.45  # El mercado debe estar desequilibrado
+	min_safe_price: float = 0.05  # Seguridad
 
-	# Step 2: Complete position when spread compresses
-	complete_threshold: float = 0.96  # Complete when UP + DOWN <= this (4% guaranteed profit)
+	# Step 2: Complete position
+	# 0.95 garantiza un 5% de margen bruto (excluyendo slippage).
+	# Como los fees son 0%, esto es 5% neto teórico.
+	complete_threshold: float = 0.95
+
+	# RESTAURAR LÓGICA ESTRICTA: Nunca entrar si la suma > 1.00
+	max_entry_threshold: float = 1.00
+
+	# Exigir un beneficio mínimo del 2% al proyectar el cierre
+	min_profit_pct: float = 2.0
 
 	# Bail-out parameters (legacy - mostly handled by scratch now)
 	bail_threshold: float = 0.10
 	bail_loss_ratio: float = 0.50
 
-	# Scratch parameters (emergency exit for pending positions)
-	# More conservative: give the market time to swing back before exiting
-	scratch_time_threshold: int = 45  # Scratch if less than 45s remaining
-	scratch_loss_threshold: float = 0.35  # Scratch if lost >35% of entry value
-	scratch_min_recovery: float = 0.03  # Only scratch if at least $0.03 to recover
+	# Scratch parameters (Salida de emergencia)
+	scratch_time_threshold: int = 45
+	scratch_loss_threshold: float = 0.25  # Cortar si perdemos 25% ($10)
+	scratch_min_recovery: float = 0.03
 
-	# Risk Controls
-	# NOTE: max_position_size = TARGET SHARES = TARGET PAYOUT
-	# e.g., 100 = 100 shares = $100 payout guaranteed if completed
-	# Max cost = 100 shares × $0.96 × 1.02 fee = ~$98
-	max_capital: float = 100.0  # Capital for one full arbitrage + margin
-	max_position_size: float = 40.0  # Target shares (100 shares = $100 payout)
-	max_concurrent_pairs: int = 11  # Maximum number of concurrent positions
+	# Risk Controls - CUENTA $100
+	max_capital: float = 100.0
+
+	# 40 acciones = $40 payout objetivo.
+	# Coste aprox: $38. Deja $62 libres para emergencias o fees de gas si hubiera.
+	max_position_size: float = 40.0
+
+	# Con $100, mejor concéntrate en 1 buena operación a la vez para no quedarte sin liquidez
+	max_concurrent_pairs: int = 1
 
 	# Fee Assumptions
-	trading_fee_percent: float = 2.0  # Trading fee percentage (2% taker fee)
+	trading_fee_percent: float = 0.0  # Correcto para Polymarket
 
 	# Execution Settings
 	# Faster polling = faster reaction to price changes (WebSocket cache is instant)

@@ -26,9 +26,9 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("hpack").setLevel(logging.WARNING)
 logging.getLogger("websockets").setLevel(logging.WARNING)
-logging.getLogger("websocket_client").setLevel(
-    logging.WARNING)  # Only show warnings/errors from WS
-logging.getLogger("polymarket_client").setLevel(logging.INFO)  # Normal logging
+logging.getLogger("websocket_client").setLevel(logging.INFO)
+logging.getLogger("polymarket_client").setLevel(logging.WARNING)
+logging.getLogger("engine").setLevel(logging.WARNING)
 
 
 def run_paper_bot():

@@ -48,6 +48,9 @@ class PolymarketRTDSClient:
 		                              Any]] = {}  # asset_id -> market data
 		self.subscribed_assets: List[str] = []
 		self.callbacks: List[Callable] = []
+		self.last_update_timestamps: Dict[str,
+		                                  float] = {}  # asset_id -> timestamp
+		self.connection_time: Optional[float] = None  # When we connected
 
 		# Auth credentials from config (for clob_user channel)
 		self.api_key = config.api_key
@@ -80,7 +83,10 @@ class PolymarketRTDSClient:
 			                                          ping_interval=30,
 			                                          ping_timeout=10,
 			                                          close_timeout=5)
+			self.connection_time = time.time()
 			logger.info(f"✅ Connected to RTDS: {self.WS_URL}")
+			# Small delay to ensure connection is fully established
+			await asyncio.sleep(0.1)
 			return True
 		except asyncio.TimeoutError:
 			logger.error("RTDS connection timeout")
@@ -96,11 +102,19 @@ class PolymarketRTDSClient:
         Args:
             asset_ids: List of token IDs to subscribe to. If None, fetches BTC market tokens.
         """
+		logger.info(
+		    f"🔔 subscribe_to_markets llamado con {len(asset_ids) if asset_ids else 0} asset_ids"
+		)
+
 		# Ensure connection
 		try:
 			is_closed = self.websocket is None or self.websocket.state.name != "OPEN"
-		except (AttributeError, Exception):
+			logger.info(
+			    f"🔍 WebSocket estado: websocket={self.websocket is not None}, is_closed={is_closed}"
+			)
+		except (AttributeError, Exception) as e:
 			is_closed = self.websocket is None
+			logger.warning(f"⚠️ Error checking WebSocket state: {e}")
 
 		if is_closed:
 			logger.info("RTDS disconnected, reconnecting...")
@@ -120,30 +134,54 @@ class PolymarketRTDSClient:
 		self.subscribed_assets = asset_ids
 
 		# Build RTDS subscription message
-		# Format: filters = comma-separated asset IDs
-		filters = ",".join(asset_ids[:100])  # Limit to 100 for safety
+		# According to RTDS docs, clob_market filters should be an array of asset IDs
+		# Limit to 100 assets per subscription for safety
+		filters = asset_ids[:100]
+		filters_json = json.dumps(filters)  # JSON-stringified array
 
-		subscribe_msg = {
-		    "action":
-		    "subscribe",
-		    "subscriptions": [{
+		# Create subscriptions for different message types to get comprehensive market data
+		# RTDS WebSocket protocol: filters must be a JSON string
+		subscriptions = [
+		    {
 		        "topic": self.TOPIC_CLOB_MARKET,
-		        "type":
-		        "*",  # All message types (price_changes, agg_orderbook, last_trade_price)
-		        "filters": filters
-		    }]
-		}
+		        "type": "price_change",  # Real-time price updates
+		        "filters": filters_json
+		    },
+		    {
+		        "topic": self.TOPIC_CLOB_MARKET,
+		        "type": "agg_orderbook",  # Order book data
+		        "filters": filters_json
+		    },
+		    {
+		        "topic": self.TOPIC_CLOB_MARKET,
+		        "type": "last_trade_price",  # Last trade prices
+		        "filters": filters_json
+		    }
+		]
 
 		# Add authentication if available (improves rate limits)
 		clob_auth = self._get_clob_auth()
 		if clob_auth:
-			subscribe_msg["subscriptions"][0]["clob_auth"] = clob_auth
+			for sub in subscriptions:
+				sub["clob_auth"] = clob_auth
 			logger.debug("Using authenticated RTDS subscription")
 
+		subscribe_msg = {"action": "subscribe", "subscriptions": subscriptions}
+
 		try:
-			await self.websocket.send(json.dumps(subscribe_msg))
+			subscription_json = json.dumps(subscribe_msg)
+			await self.websocket.send(subscription_json)
 			logger.info(
 			    f"📡 RTDS: Subscribed to {len(asset_ids)} market tokens")
+			logger.info(
+			    f"  📤 Mensaje de suscripción enviado: {subscription_json}")
+
+			# Log asset IDs for debugging
+			if asset_ids:
+				logger.info(
+				    f"  📋 Asset IDs para suscripción RTDS: {asset_ids[:10]}")
+				logger.info(f"  📋 Total: {len(asset_ids)} asset IDs")
+
 			return True
 		except Exception as e:
 			logger.error(f"Failed to subscribe to RTDS: {e}")
@@ -158,6 +196,22 @@ class PolymarketRTDSClient:
 			self.callbacks.append(callback)
 
 		try:
+			# Send periodic PING to keep connection alive (every 10 seconds as per Polymarket docs)
+			async def ping_task():
+				while self.running and self.websocket:
+					try:
+						await asyncio.sleep(10)
+						if self.websocket and self.websocket.open:
+							await self.websocket.ping()
+							logger.debug(
+							    "📡 Sent PING to keep connection alive")
+					except Exception as e:
+						logger.debug(f"PING error: {e}")
+						break
+
+			# Start ping task
+			ping_task_handle = asyncio.create_task(ping_task())
+
 			async for message in self.websocket:
 				try:
 					# Skip empty messages
@@ -165,12 +219,25 @@ class PolymarketRTDSClient:
 						continue
 
 					data = json.loads(message)
+
+					# Log first few raw messages to debug
+					if not hasattr(self, '_raw_message_count'):
+						self._raw_message_count = 0
+					self._raw_message_count += 1
+					# Log ALL messages (no limit) to debug why we're not receiving data
+					logger.info(
+					    f"📥 Raw message #{self._raw_message_count}: {str(message)[:500]}..."
+					)
+
 					await self._process_message(data)
 				except json.JSONDecodeError as e:
 					if message and message.strip():
 						logger.warning(f"Failed to parse RTDS message: {e}")
 				except Exception as e:
 					logger.error(f"Error processing RTDS message: {e}")
+
+			# Cancel ping task when done
+			ping_task_handle.cancel()
 		except websockets.exceptions.ConnectionClosed:
 			logger.warning("RTDS connection closed")
 		except Exception as e:
@@ -189,20 +256,187 @@ class PolymarketRTDSClient:
             "timestamp": 1234567890123,
             "payload": { ... }
         }
+
+        Initial snapshot format (NO topic field):
+        {
+            "connection_id": "...",
+            "payload": [ ... ]  # List of orderbook snapshots
+        }
+
+        Also handles subscription confirmations and errors.
         """
+		# Check for subscription confirmation or error messages
+		if "action" in data:
+			action = data.get("action")
+			if action == "subscribed":
+				logger.info(
+				    f"✅ RTDS subscription confirmed: {json.dumps(data, indent=2)}"
+				)
+				return
+			elif action == "error":
+				logger.error(
+				    f"❌ RTDS subscription error: {json.dumps(data, indent=2)}")
+				return
+			elif action == "unsubscribed":
+				logger.info(
+				    f"ℹ️ RTDS unsubscribed: {json.dumps(data, indent=2)}")
+				return
+
+		# Also check for "message" field which might indicate errors
+		if "message" in data:
+			msg = data.get("message")
+			if "Invalid" in msg or "error" in msg.lower():
+				logger.error(
+				    f"❌ RTDS error message: {json.dumps(data, indent=2)}")
+				return
+
 		topic = data.get("topic")
 		msg_type = data.get("type")
-		payload = data.get("payload", {})
+		payload = data.get("payload")
 
-		if topic != self.TOPIC_CLOB_MARKET:
+		# Initialize message counter if needed
+		if not hasattr(self, '_message_count'):
+			self._message_count = 0
+		self._message_count += 1
+
+		# CRITICAL FIX: Handle initial snapshot message that has NO topic field
+		# According to RTDS protocol (see https://github.com/Polymarket/real-time-data-client):
+		# When connection is established and a filter is used, the server sends an initial data dump.
+		# Initial snapshot format: {"connection_id": "...", "payload": [...]}  # payload is a LIST
+		# NOTE: Regular messages also have connection_id, but they have topic field OR payload is a dict with 'pc' (price_changes)
+		# Reference: https://github.com/Polymarket/real-time-data-client#initial-data-dump-on-connection
+		# Check for connection_id AND payload as list (true initial snapshot)
+		if "connection_id" in data and topic is None and isinstance(
+		    payload, list):
+			if self._message_count <= 5:
+				logger.info(
+				    f"  📦 Initial snapshot detected: connection_id={data.get('connection_id')[:20]}..., payload is a list with {len(payload)} items"
+				)
+
+			# Process each item in the list as an orderbook snapshot
+			if payload:
+				for item in payload:
+					if isinstance(item, dict):
+						# Initial snapshots don't have topic/type, assume clob_market/agg_orderbook
+						effective_topic = self.TOPIC_CLOB_MARKET
+						effective_type = msg_type or "agg_orderbook"
+						await self._process_single_payload(
+						    effective_topic, effective_type, item)
+			else:
+				logger.debug("  ⚠️ Initial snapshot has empty payload list")
 			return
 
-		if msg_type == "price_changes":
+		# Fallback: Handle payload as list even without connection_id (some RTDS variants)
+		if isinstance(payload, list):
+			if self._message_count <= 5:
+				logger.info(
+				    f"  📦 Payload is a list with {len(payload)} items (snapshot format)"
+				)
+			if payload:
+				for item in payload:
+					if isinstance(item, dict):
+						# Use topic from message or default to clob_market
+						effective_topic = topic or self.TOPIC_CLOB_MARKET
+						effective_type = msg_type or "agg_orderbook"
+						await self._process_single_payload(
+						    effective_topic, effective_type, item)
+			return
+
+		# Default payload to empty dict if None
+		if payload is None:
+			payload = {}
+
+		# Log first 20 messages in detail, then less frequently
+		if self._message_count <= 20 or self._message_count % 50 == 0:
+			logger.info(
+			    f"📨 RTDS msg #{self._message_count}: topic={topic}, type={msg_type}, cache_size={len(self.markets_cache)}"
+			)
+			if payload and isinstance(payload, dict):
+				# Log payload structure for first few messages
+				if self._message_count <= 10:
+					logger.info(
+					    f"  📦 Payload keys: {list(payload.keys())[:10]}")
+					# For price_change messages, asset_id is inside pc array, not in root
+					if "pc" in payload:
+						pc_list = payload.get("pc", [])
+						if pc_list and isinstance(pc_list,
+						                          list) and len(pc_list) > 0:
+							first_pc = pc_list[0] if isinstance(
+							    pc_list[0], dict) else {}
+							asset_id = first_pc.get("a") or first_pc.get(
+							    "asset_id")
+							if asset_id:
+								logger.info(
+								    f"  ✅ Price change message with {len(pc_list)} updates, first asset_id: {asset_id[:50]}..."
+								)
+							else:
+								logger.debug(
+								    f"  📊 Price change message with {len(pc_list)} updates (asset_id in pc array)"
+								)
+					else:
+						# For other message types, check root level
+						asset_id = payload.get("asset_id") or payload.get("a")
+						if asset_id:
+							logger.info(
+							    f"  ✅ Asset ID recibido: {asset_id[:50]}...")
+						elif self._message_count <= 10:
+							logger.debug(
+							    f"  📊 Message type {msg_type} (asset_id may be nested)"
+							)
+
+		# Process single payload
+		await self._process_single_payload(topic, msg_type, payload)
+
+	async def _process_single_payload(self, topic: str, msg_type: str,
+	                                  payload: Dict[str, Any]):
+		"""Process a single payload dictionary."""
+
+		# Ensure payload is a dict
+		if not isinstance(payload, dict):
+			if self._message_count <= 10:
+				logger.warning(
+				    f"  ⚠️ Payload is not a dict, type: {type(payload)}, value: {str(payload)[:100]}"
+				)
+			return
+
+		# If topic is None or empty, assume it's clob_market (for initial snapshots)
+		# If topic is None or empty, assume it's clob_market (for initial snapshots)
+		if topic is None or topic == "":
+			topic = self.TOPIC_CLOB_MARKET
+		elif topic != self.TOPIC_CLOB_MARKET:
+			if self._message_count <= 10:
+				logger.info(f"  ⚠️ Skipping non-clob_market topic: {topic}")
+			return
+
+		# Handle different message types from clob_market topic
+		# RTDS sends: price_change (singular), agg_orderbook, last_trade_price, etc.
+		# If msg_type is None or empty, check payload structure to determine type
+		if not msg_type:
+			# Check if payload has price_changes structure (pc field indicates price_change)
+			if "pc" in payload or "price_changes" in payload:
+				msg_type = "price_change"  # Use singular form as per RTDS protocol
+			# Check if payload has orderbook structure (bids/asks)
+			elif "bids" in payload or "asks" in payload:
+				msg_type = "agg_orderbook"
+			elif "price" in payload and "asset_id" in payload:
+				msg_type = "last_trade_price"
+			else:
+				# Default to orderbook for snapshots
+				msg_type = "agg_orderbook"
+
+		if msg_type == "price_change" or msg_type == "price_changes":  # Support both for compatibility
 			await self._handle_price_changes(payload)
 		elif msg_type == "agg_orderbook":
 			await self._handle_orderbook(payload)
 		elif msg_type == "last_trade_price":
 			await self._handle_trade(payload)
+		else:
+			if self._message_count <= 10:
+				payload_keys = list(payload.keys())[:5] if isinstance(
+				    payload, dict) else 'not a dict'
+				logger.info(
+				    f"  ⚠️ Unknown message type: {msg_type} (payload keys: {payload_keys})"
+				)
 
 	async def _handle_price_changes(self, payload: Dict[str, Any]):
 		"""
@@ -227,14 +461,30 @@ class PolymarketRTDSClient:
 		market = payload.get("m") or payload.get("market")
 		price_changes = payload.get("pc") or payload.get("price_changes", [])
 
+		if not price_changes:
+			if self._message_count <= 10:
+				logger.debug("  ⚠️ Price change message has empty pc array")
+			return
+
+		processed_count = 0
 		for pc in price_changes:
-			asset_id = pc.get("a") or pc.get("asset_id")
-			if not asset_id:
+			if not isinstance(pc, dict):
 				continue
 
+			# Asset ID is stored as "a" in compact format (not "asset_id")
+			asset_id = pc.get("a") or pc.get("asset_id")
+			if not asset_id:
+				if self._message_count <= 10:
+					logger.debug(
+					    f"  ⚠️ Price change entry missing asset_id, keys: {list(pc.keys())}"
+					)
+				continue
+
+			# Best bid/ask are stored as "bb" and "ba" in compact format
 			best_bid = pc.get("bb") or pc.get("best_bid")
 			best_ask = pc.get("ba") or pc.get("best_ask")
 
+			# Initialize cache entry if needed
 			if asset_id not in self.markets_cache:
 				self.markets_cache[asset_id] = {
 				    "asset_id": asset_id,
@@ -246,10 +496,21 @@ class PolymarketRTDSClient:
 				    "last_price": None,
 				}
 
+			# Update best bid/ask
 			if best_bid:
 				self.markets_cache[asset_id]["best_bid"] = float(best_bid)
 			if best_ask:
 				self.markets_cache[asset_id]["best_ask"] = float(best_ask)
+
+			# Track last update time
+			self.last_update_timestamps[asset_id] = time.time()
+			processed_count += 1
+
+		# Log successful processing for first few messages
+		if self._message_count <= 5 and processed_count > 0:
+			logger.info(
+			    f"  ✅ Processed {processed_count}/{len(price_changes)} price changes successfully"
+			)
 
 	async def _handle_orderbook(self, payload: Dict[str, Any]):
 		"""
@@ -266,7 +527,17 @@ class PolymarketRTDSClient:
         """
 		asset_id = payload.get("asset_id")
 		if not asset_id:
+			# Log for debugging when asset_id is missing
+			if self._message_count <= 10:
+				logger.warning(
+				    f"  ⚠️ Orderbook payload missing asset_id, keys: {list(payload.keys())[:10]}"
+				)
 			return
+
+		# Log successful processing for first few items
+		if self._message_count <= 5:
+			logger.info(
+			    f"  ✅ Processing orderbook for asset_id: {asset_id[:20]}...")
 
 		bids = payload.get("bids", [])
 		asks = payload.get("asks", [])
@@ -298,6 +569,9 @@ class PolymarketRTDSClient:
 			self.markets_cache[asset_id]["best_ask"] = float(
 			    sorted_asks[0].get("price", 0))
 
+		# Track last update time
+		self.last_update_timestamps[asset_id] = time.time()
+
 	async def _handle_trade(self, payload: Dict[str, Any]):
 		"""Handle last_trade_price message from RTDS."""
 		asset_id = payload.get("asset_id")
@@ -315,6 +589,8 @@ class PolymarketRTDSClient:
 				    "last_price": None,
 				}
 			self.markets_cache[asset_id]["last_price"] = float(price)
+			# Track last update time
+			self.last_update_timestamps[asset_id] = time.time()
 
 	async def _fetch_market_tokens(self) -> List[str]:
 		"""Fetch up/down market token IDs for all supported tokens from Gamma API."""
@@ -449,11 +725,48 @@ class PolymarketRTDSClient:
 
 		return None
 
-	def get_instant_quote(self, asset_id: str) -> Optional[tuple]:
+	def is_connected(self) -> bool:
+		"""Check if WebSocket is connected and active."""
+		if not self.websocket:
+			return False
+		try:
+			# Check WebSocket state
+			state = self.websocket.state.name if hasattr(
+			    self.websocket, 'state') else None
+			return state == "OPEN"
+		except (AttributeError, Exception):
+			return False
+
+	def is_data_fresh(self,
+	                  asset_id: str,
+	                  max_age_seconds: float = 60.0) -> bool:
+		"""
+        Check if cached data for an asset is fresh (updated within max_age_seconds).
+
+        Default is 60 seconds to account for low-liquidity periods where markets
+        may not update frequently. RTDS sends initial snapshots, but updates may
+        be sparse during quiet periods.
+        """
+		if asset_id not in self.last_update_timestamps:
+			return False
+		age = time.time() - self.last_update_timestamps[asset_id]
+		return age <= max_age_seconds
+
+	def get_instant_quote(self,
+	                      asset_id: str,
+	                      require_fresh: bool = True) -> Optional[tuple]:
 		"""
         Get instant bid/ask quote from RTDS cache.
         Returns (best_bid, best_ask) or None if no data.
+
+        Args:
+            asset_id: The asset token ID
+            require_fresh: If True, only return data updated within last 60 seconds (default freshness window)
         """
+		# Check if data is fresh (if required)
+		if require_fresh and not self.is_data_fresh(asset_id):
+			return None
+
 		bid = self.get_best_bid(asset_id)
 		ask = self.get_best_ask(asset_id)
 

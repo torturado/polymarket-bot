@@ -129,7 +129,7 @@ class PolymarketClient:
 
 	def list_markets(self) -> list[Market]:
 		"""
-        Fetch 15-minute up/down markets for all supported tokens.
+        Fetch up/down markets (15-minute and hourly) for all supported tokens.
 
         Uses the Gamma API to get market data.
         WebSocket is used for real-time price updates, not for market discovery.
@@ -146,147 +146,48 @@ class PolymarketClient:
 
 	def _list_markets_from_api(self) -> list[Market]:
 		"""
-        Fetch 15-minute up/down markets for all supported tokens using Gamma Events API.
-
-        Uses Gamma Events API to get full market details including question/title.
-        Events endpoint provides better results for active markets.
+        Fetch up/down markets SIMPLIFIED: Just get active events and extract token IDs.
+        WebSocket will handle real-time price updates - we just need the token IDs.
         """
 		try:
 			import requests
 			import json
 
-			# Use events endpoint for better active market discovery
+			# SIMPLIFIED: Just fetch active events (one call, no complex strategies)
 			events_url = "https://gamma-api.polymarket.com/events"
-			markets_url = "https://gamma-api.polymarket.com/markets"
 
+			logger.info("Fetching active markets from Gamma API...")
+			params = {
+			    "order": "id",
+			    "ascending": "false",
+			    "closed": "false",
+			    "limit": 100  # Enough to get current markets
+			}
+
+			response = robust_http_get(events_url, params=params)
+			if not response:
+				logger.warning("No response from Gamma API")
+				return []
+
+			events = response.json()
+			if not events:
+				logger.warning("No events returned")
+				return []
+
+			# Extract all markets from events
 			all_markets = []
 			seen_condition_ids = set()
 
-			# Strategy 1: Fetch active events (newest first)
-			logger.info("Fetching active events from Gamma API...")
-			try:
-				for offset in [0, 100, 200]:
-					params = {
-					    "order": "id",
-					    "ascending": "false",  # Newest first
-					    "closed": "false",
-					    "limit": 100,
-					    "offset": offset
-					}
-
-					response = robust_http_get(events_url, params=params)
-					if not response:
-						break
-					events = response.json()
-
-					if not events:
-						break
-
-					# Extract markets from events
-					for event in events:
-						event_markets = event.get("markets", [])
-						for market in event_markets:
-							cid = market.get("conditionId") or market.get(
-							    "condition_id")
-							if cid and cid not in seen_condition_ids:
-								# Add event info to market for context
-								market["_event_title"] = event.get("title", "")
-								market["_event_slug"] = event.get("slug", "")
-								all_markets.append(market)
-								seen_condition_ids.add(cid)
-
-					logger.debug(
-					    f"Fetched {len(events)} events (offset {offset}), total markets: {len(all_markets)}"
-					)
-
-					if len(events) < 100:
-						break
-
-			except Exception as e:
-				logger.warning(f"Error fetching events: {e}")
-
-			# Strategy 2: Fetch up/down markets directly by searching for all supported tokens
-			# This catches markets that might be "closed" for new positions but still active
-			try:
-				supported_tokens = getattr(self.config, 'supported_tokens',
-				                           ['BTC', 'ETH', 'SOL', 'XRP'])
-				for token in supported_tokens:
-					token_lower = token.lower()
-					search_params = {
-					    "limit": 100,
-					    "_q": f"{token_lower}-updown-15m"  # Search query
-					}
-
-					response = robust_http_get(markets_url,
-					                           params=search_params)
-					if not response:
-						continue
-					direct_markets = response.json()
-
-					for market in direct_markets:
-						cid = market.get("conditionId") or market.get(
-						    "condition_id")
-						if cid and cid not in seen_condition_ids:
-							all_markets.append(market)
-							seen_condition_ids.add(cid)
-
-					logger.debug(
-					    f"Added {len(direct_markets)} {token} markets from search endpoint"
-					)
-
-			except Exception as e:
-				logger.warning(f"Error fetching direct markets: {e}")
-
-			# Strategy 3: Calculate and fetch the CURRENT market directly by slug for all tokens
-			try:
-				supported_tokens = getattr(self.config, 'supported_tokens',
-				                           ['BTC', 'ETH', 'SOL', 'XRP'])
-				now_ts = int(datetime.now(timezone.utc).timestamp())
-				current_window_start = (
-				    now_ts // 900) * 900  # Round down to 15-min boundary
-
-				for token in supported_tokens:
-					token_lower = token.lower()
-					current_slug = f"{token_lower}-updown-15m-{current_window_start}"
-
-					# Try to fetch the current market directly
-					response = robust_http_get(
-					    f"{markets_url}?slug={current_slug}")
-					if response and response.status_code == 200:
-						current_markets = response.json()
-						if current_markets:
-							for market in (current_markets if isinstance(
-							    current_markets, list) else [current_markets]):
-								cid = market.get("conditionId") or market.get(
-								    "condition_id")
-								if cid and cid not in seen_condition_ids:
-									all_markets.append(market)
-									seen_condition_ids.add(cid)
-									logger.info(
-									    f"✅ Found current {token} market: {current_slug}"
-									)
-
-					# Also try next market
-					next_window_start = current_window_start + 900
-					next_slug = f"{token_lower}-updown-15m-{next_window_start}"
-					response = robust_http_get(
-					    f"{markets_url}?slug={next_slug}")
-					if response and response.status_code == 200:
-						next_markets = response.json()
-						if next_markets:
-							for market in (next_markets if isinstance(
-							    next_markets, list) else [next_markets]):
-								cid = market.get("conditionId") or market.get(
-								    "condition_id")
-								if cid and cid not in seen_condition_ids:
-									all_markets.append(market)
-									seen_condition_ids.add(cid)
-
-			except Exception as e:
-				logger.debug(f"Error fetching current markets by slug: {e}")
-
-			# Skip fetching closed markets - focus on active ones for paper trading
-			# The events endpoint already gives us active markets
+			for event in events:
+				event_markets = event.get("markets", [])
+				for market in event_markets:
+					cid = market.get("conditionId") or market.get(
+					    "condition_id")
+					if cid and cid not in seen_condition_ids:
+						market["_event_title"] = event.get("title", "")
+						market["_event_slug"] = event.get("slug", "")
+						all_markets.append(market)
+						seen_condition_ids.add(cid)
 
 			markets_data = all_markets
 
@@ -374,68 +275,13 @@ class PolymarketClient:
 					    "title",
 					    "").lower() if market_data.get("title") else ""
 
-					# Check for up/down 15-minute markets for all supported tokens
-					# These have slugs like "btc-updown-15m-1765358100", "eth-updown-15m-1765443600", etc.
-					slug = market_data.get("slug", "").lower()
+					# Filter markets by structure, not by name - more robust approach
+					# We want markets that:
+					# 1. Have clobTokenIds (are CLOB markets) with exactly 2 tokens
+					# 2. Have exactly 2 outcomes (UP/DOWN pairs)
+					# 3. Outcomes contain "Up" and "Down" (case-insensitive)
 
-					# Get supported tokens from config
-					supported_tokens = getattr(self.config, 'supported_tokens',
-					                           ['BTC', 'ETH', 'SOL', 'XRP'])
-					token_patterns = [
-					    f"{token.lower()}-updown-15m"
-					    for token in supported_tokens
-					]
-
-					# Also check for common token name variations
-					token_variations = {
-					    "btc": ["bitcoin"],
-					    "eth": ["ethereum"],
-					    "sol": ["solana"],
-					    "xrp": ["ripple"]
-					}
-					for token_lower in [t.lower() for t in supported_tokens]:
-						if token_lower in token_variations:
-							for variation in token_variations[token_lower]:
-								token_patterns.append(
-								    f"{variation}-updown-15m")
-
-					# STRICT filter: Only match the specific 15-minute up/down markets for supported tokens
-					is_supported_updown_15m = False
-					matched_token = None
-					for pattern in token_patterns:
-						if pattern in slug:
-							is_supported_updown_15m = True
-							# Extract token from pattern
-							matched_token = pattern.split("-")[0].upper()
-							break
-
-					# Also check generic pattern: token + updown + 15m
-					if not is_supported_updown_15m:
-						for token_lower in [
-						    t.lower() for t in supported_tokens
-						]:
-							if token_lower in slug and "updown" in slug and "15m" in slug:
-								is_supported_updown_15m = True
-								matched_token = token_lower.upper()
-								break
-
-					# Log for debugging
-					if is_supported_updown_15m and len(markets) < 10:
-						logger.debug(
-						    f"✅ Found {matched_token} 15m market - Slug: {slug} | "
-						    f"Question: {market_data.get('question', '')[:50]}..."
-						)
-
-					# ONLY accept 15-minute up/down markets for supported tokens
-					if not is_supported_updown_15m:
-						continue
-
-					# Get condition ID (Gamma API structure)
-					condition_id = market_data.get("conditionId",
-					                               "") or market_data.get(
-					                                   "condition_id", "")
-
-					# Parse outcomes - they might be a JSON string or array
+					# Parse outcomes first
 					outcomes_raw = market_data.get("outcomes", [])
 					outcomes = []
 					if isinstance(outcomes_raw, str):
@@ -446,7 +292,11 @@ class PolymarketClient:
 					elif isinstance(outcomes_raw, list):
 						outcomes = outcomes_raw
 
-					# Extract token IDs from clobTokenIds (Gamma API uses this field)
+					# Must have exactly 2 outcomes for UP/DOWN markets
+					if len(outcomes) != 2:
+						continue
+
+					# Extract token IDs from clobTokenIds (must exist for CLOB markets)
 					token_ids = []
 					clob_token_ids_raw = market_data.get("clobTokenIds", "")
 					if isinstance(clob_token_ids_raw, str):
@@ -456,6 +306,56 @@ class PolymarketClient:
 							pass
 					elif isinstance(clob_token_ids_raw, list):
 						token_ids = clob_token_ids_raw
+
+					# Must have clobTokenIds with exactly 2 tokens (this is a CLOB market)
+					if not token_ids or len(token_ids) != 2:
+						continue
+
+					# Check if outcomes contain "Up" and "Down"
+					outcome_names = []
+					for outcome in outcomes:
+						if isinstance(outcome, dict):
+							name = (outcome.get("name") or outcome.get("title")
+							        or "").lower()
+						else:
+							name = str(outcome).lower()
+						outcome_names.append(name)
+
+					has_up = any("up" in name and "down" not in name
+					             for name in outcome_names)
+					has_down = any("down" in name for name in outcome_names)
+
+					# Must have both UP and DOWN outcomes
+					if not (has_up and has_down):
+						continue
+
+					# Optional: Log token name if found in question/title (for debugging)
+					question = (market_data.get("question")
+					            or market_data.get("title") or "").lower()
+					supported_tokens = getattr(self.config, 'supported_tokens',
+					                           ['BTC', 'ETH', 'SOL', 'XRP'])
+					token_keywords = [t.lower() for t in supported_tokens] + [
+					    "bitcoin", "ethereum", "solana", "ripple"
+					]
+
+					matched_token = None
+					for token_keyword in token_keywords:
+						if token_keyword in question:
+							matched_token = token_keyword.upper()
+							break
+
+					# Log for debugging
+					if len(markets) < 10:
+						slug = market_data.get("slug", "")
+						logger.debug(
+						    f"✅ Found UP/DOWN market - Token: {matched_token or 'unknown'} | "
+						    f"Slug: {slug[:50]}... | Question: {question[:50]}..."
+						)
+
+					# Get condition ID (Gamma API structure)
+					condition_id = market_data.get("conditionId",
+					                               "") or market_data.get(
+					                                   "condition_id", "")
 
 					# Fallback: try to get from outcomes if they're dicts
 					if not token_ids and outcomes:
@@ -776,7 +676,7 @@ class PolymarketClient:
 
 	def find_market_pairs(self, only_current: bool = True) -> list[MarketPair]:
 		"""
-        Find and pair UP/DOWN markets for all supported tokens' 15-minute markets.
+        Find and pair UP/DOWN markets for all supported tokens (15-minute and hourly markets).
 
         Args:
             only_current: If True, only return the market pair ending soonest (current active).

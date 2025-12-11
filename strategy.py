@@ -44,32 +44,52 @@ class LegInStrategy:
         CRITICAL: Only enter if arbitrage is CURRENTLY possible.
         If UP + DOWN > complete_threshold, there's NO profit opportunity.
         """
-		# SAFETY: Don't buy if less than 4 minutes remaining
-		if time_remaining_seconds is not None and time_remaining_seconds < 240:
+		up_price = pair_quote.up_quote.price
+		down_price = pair_quote.down_quote.price
+		combined_price = up_price + down_price
+
+		# DEBUG: Log entry for every check
+		logger.debug(
+		    f"🔍 Checking entry: UP=${up_price:.3f} DOWN=${down_price:.3f} "
+		    f"Combined=${combined_price:.3f} | Pair={pair_quote.pair_id[:8]}..."
+		)
+
+		# SAFETY: Don't buy if less time remaining than configured minimum
+		min_time_remaining = getattr(self.config, 'min_time_remaining_seconds',
+		                             120)
+		if time_remaining_seconds is not None and time_remaining_seconds < min_time_remaining:
+			logger.debug(
+			    f"❌ REJECT: Time remaining {time_remaining_seconds:.0f}s < {min_time_remaining}s"
+			)
 			return None
 
 		# Check concurrent positions limit
 		if len(pending_positions) >= self.config.max_concurrent_pairs:
+			logger.debug(
+			    f"❌ REJECT: Max concurrent positions ({len(pending_positions)} >= {self.config.max_concurrent_pairs})"
+			)
 			return None
 
 		# Check if we already have a position in this pair
 		for pos in pending_positions:
 			if pos.pair_id == pair_quote.pair_id:
+				logger.debug(
+				    f"❌ REJECT: Already have position in pair {pair_quote.pair_id[:8]}..."
+				)
 				return None
 
-		up_price = pair_quote.up_quote.price
-		down_price = pair_quote.down_quote.price
-		combined_price = up_price + down_price
+		# ═══════════════════════════════════════════════════════════════════
+		# RELAXED ENTRY FOR TESTING: Allow higher combined prices
+		# ═══════════════════════════════════════════════════════════════════
+		# Get max_entry_threshold from config
+		# NOTE: In binary markets, UP + DOWN always sums to ~1.0, so max_entry_threshold
+		# should be >= 1.0 to allow entries. Default to 1.10 for testing.
+		max_entry_threshold = getattr(self.config, 'max_entry_threshold', 1.10)
 
-		# ═══════════════════════════════════════════════════════════════════
-		# CRITICAL CHECK: Is arbitrage CURRENTLY possible?
-		# If UP + DOWN > complete_threshold, there's NO PROFIT to be made.
-		# This prevents buying during a one-sided market crash.
-		# ═══════════════════════════════════════════════════════════════════
-		if combined_price > self.config.complete_threshold:
+		if combined_price > max_entry_threshold:
 			logger.debug(
-			    f"⚠️ No arbitrage: UP ${up_price:.3f} + DOWN ${down_price:.3f} = ${combined_price:.3f} "
-			    f"> threshold ${self.config.complete_threshold:.2f}")
+			    f"❌ REJECT: Combined ${combined_price:.3f} > max_entry_threshold ${max_entry_threshold:.2f}"
+			)
 			return None
 
 		# Target shares = max_position_size (e.g., 100 shares = $100 payout)
@@ -79,57 +99,77 @@ class LegInStrategy:
 		available_capital = self.config.max_capital - total_capital_deployed
 
 		# Estimate TOTAL cost for full arbitrage (both legs) at CURRENT prices
-		estimated_total_cost = target_shares * combined_price * 1.02  # +2% fees
+		# No fees on Polymarket (https://docs.polymarket.com/polymarket-learn/trading/fees)
+		estimated_total_cost = target_shares * combined_price
 
 		# Don't enter if we can't afford the full arbitrage at current prices
 		if available_capital < estimated_total_cost:
-			logger.debug(
-			    f"⚠️ Insufficient capital: have ${available_capital:.2f}, need ${estimated_total_cost:.2f}"
-			)
+			logger.warning(
+			    f"❌ REJECT: Insufficient capital: have ${available_capital:.2f}, need ${estimated_total_cost:.2f} "
+			    f"(shares={target_shares}, combined=${combined_price:.3f})")
 			return None
 
 		# SAFETY: Don't buy extremely cheap options (market already decided)
 		# If UP is at $0.10 and DOWN is at $0.85, the market is 85% sure DOWN wins
-		min_safe_price = getattr(self.config, 'min_safe_price', 0.15)
-		if up_price < min_safe_price:
-			logger.debug(
-			    f"⚠️ UP too cheap @ ${up_price:.3f} - market decided DOWN wins"
-			)
-			return None
-		if down_price < min_safe_price:
-			logger.debug(
-			    f"⚠️ DOWN too cheap @ ${down_price:.3f} - market decided UP wins"
-			)
-			return None
+		min_safe_price = getattr(self.config, 'min_safe_price', 0.00)
+		if min_safe_price > 0:  # Only check if configured
+			if up_price < min_safe_price:
+				logger.debug(
+				    f"❌ REJECT: UP too cheap @ ${up_price:.3f} < min_safe_price ${min_safe_price:.3f}"
+				)
+				return None
+			if down_price < min_safe_price:
+				logger.debug(
+				    f"❌ REJECT: DOWN too cheap @ ${down_price:.3f} < min_safe_price ${min_safe_price:.3f}"
+				)
+				return None
 
 		# Check for imbalance (spread threshold)
 		spread = abs(up_price - down_price)
-		min_spread = getattr(self.config, 'min_spread_to_enter', 0.30)
+		min_spread = getattr(self.config, 'min_spread_to_enter', 0.00)
 
 		if spread < min_spread:
+			logger.debug(
+			    f"❌ REJECT: Spread ${spread:.3f} < min_spread ${min_spread:.3f}"
+			)
 			return None
 
-		# Calculate potential profit
-		potential_profit = 1.0 - combined_price
-		potential_profit_pct = potential_profit * 100
+		# Calculate potential profit if we complete at threshold
+		# NOTE: complete_threshold should be <= 1.0 for binary markets
+		# If it's > 1.0, we'll calculate negative profit which will be rejected
+		effective_complete_threshold = min(self.config.complete_threshold, 1.0)
+		potential_profit_at_completion = 1.0 - effective_complete_threshold
+		potential_profit_pct = potential_profit_at_completion * 100
 
-		# Only enter if profit is significant (at least 3%)
-		if potential_profit_pct < 3.0:
-			logger.debug(f"⚠️ Profit too small: {potential_profit_pct:.1f}%")
+		# Only enter if potential profit is reasonable (at least 0% when completed)
+		# Relaxed for testing - allow even small profits
+		min_profit_pct = getattr(self.config, 'min_profit_pct', 0.0)
+		if potential_profit_pct < min_profit_pct:
+			logger.debug(
+			    f"❌ REJECT: Potential profit {potential_profit_pct:.1f}% < min_profit_pct {min_profit_pct:.1f}%"
+			)
 			return None
 
 		# Buy the cheaper side if it's below threshold
-		if up_price <= self.config.first_leg_threshold and up_price < down_price:
+		# FIXED: Use <= instead of < to allow entry when prices are equal
+		if up_price <= self.config.first_leg_threshold and up_price <= down_price:
 			logger.info(
-			    f"📈 Arbitrage opportunity! UP ${up_price:.3f} + DOWN ${down_price:.3f} = ${combined_price:.3f} "
-			    f"| Profit: {potential_profit_pct:.1f}%")
+			    f"✅ ENTRY SIGNAL! UP ${up_price:.3f} + DOWN ${down_price:.3f} = ${combined_price:.3f} "
+			    f"| Profit: {potential_profit_pct:.1f}% | Buying UP")
 			return MarketSide.UP
-		elif down_price <= self.config.first_leg_threshold and down_price < up_price:
+		elif down_price <= self.config.first_leg_threshold and down_price <= up_price:
 			logger.info(
-			    f"📉 Arbitrage opportunity! UP ${up_price:.3f} + DOWN ${down_price:.3f} = ${combined_price:.3f} "
-			    f"| Profit: {potential_profit_pct:.1f}%")
+			    f"✅ ENTRY SIGNAL! UP ${up_price:.3f} + DOWN ${down_price:.3f} = ${combined_price:.3f} "
+			    f"| Profit: {potential_profit_pct:.1f}% | Buying DOWN")
 			return MarketSide.DOWN
 
+		# Final check: why didn't we enter?
+		logger.debug(
+		    f"❌ REJECT: No entry condition met | "
+		    f"UP ${up_price:.3f} <= threshold ${self.config.first_leg_threshold:.2f}? {up_price <= self.config.first_leg_threshold} | "
+		    f"DOWN ${down_price:.3f} <= threshold ${self.config.first_leg_threshold:.2f}? {down_price <= self.config.first_leg_threshold} | "
+		    f"UP <= DOWN? {up_price <= down_price} | DOWN <= UP? {down_price <= up_price}"
+		)
 		return None
 
 	def create_first_leg_position(
@@ -150,12 +190,12 @@ class LegInStrategy:
 		if side == MarketSide.UP:
 			entry_price = pair_quote.up_quote.price
 			cost_usd = target_shares * entry_price
-			cost_with_fees = cost_usd * (
-			    1.0 + self.config.trading_fee_percent / 100.0)
+			# No fees on Polymarket
+			total_cost = cost_usd
 
-			if cost_with_fees > available_capital:
+			if total_cost > available_capital:
 				logger.warning(
-				    f"Insufficient capital for Leg 1: need ${cost_with_fees:.2f}, have ${available_capital:.2f}"
+				    f"Insufficient capital for Leg 1: need ${total_cost:.2f}, have ${available_capital:.2f}"
 				)
 				return None
 
@@ -170,17 +210,17 @@ class LegInStrategy:
 			                    market_end_date=market_end_date,
 			                    up_size_usd=cost_usd,
 			                    down_size_usd=0.0,
-			                    total_cost_usd=cost_with_fees,
+			                    total_cost_usd=total_cost,
 			                    status=PositionStatus.PENDING_UP)
 		else:
 			entry_price = pair_quote.down_quote.price
 			cost_usd = target_shares * entry_price
-			cost_with_fees = cost_usd * (
-			    1.0 + self.config.trading_fee_percent / 100.0)
+			# No fees on Polymarket
+			total_cost = cost_usd
 
-			if cost_with_fees > available_capital:
+			if total_cost > available_capital:
 				logger.warning(
-				    f"Insufficient capital for Leg 1: need ${cost_with_fees:.2f}, have ${available_capital:.2f}"
+				    f"Insufficient capital for Leg 1: need ${total_cost:.2f}, have ${available_capital:.2f}"
 				)
 				return None
 
@@ -195,12 +235,12 @@ class LegInStrategy:
 			                    market_end_date=market_end_date,
 			                    up_size_usd=0.0,
 			                    down_size_usd=cost_usd,
-			                    total_cost_usd=cost_with_fees,
+			                    total_cost_usd=total_cost,
 			                    status=PositionStatus.PENDING_DOWN)
 
 		logger.info(
 		    f"🎫 First leg bought! {side.value.upper()} @ ${entry_price:.3f} | "
-		    f"Shares: {target_shares:.0f} | Cost: ${cost_with_fees:.2f}")
+		    f"Shares: {target_shares:.0f} | Cost: ${total_cost:.2f}")
 		return position
 
 	def should_complete_position(self, position: Position,
@@ -239,18 +279,18 @@ class LegInStrategy:
 			# Buy DOWN to match shares
 			entry_price = pair_quote.down_quote.price
 			cost_usd = shares_held * entry_price
-			cost_with_fees = cost_usd * (
-			    1.0 + self.config.trading_fee_percent / 100.0)
+			# No fees on Polymarket
+			total_cost = cost_usd
 
-			if cost_with_fees > available_capital:
+			if total_cost > available_capital:
 				logger.warning(
-				    f"Insufficient capital to complete hedge: need ${cost_with_fees:.2f}, have ${available_capital:.2f}"
+				    f"Insufficient capital to complete hedge: need ${total_cost:.2f}, have ${available_capital:.2f}"
 				)
 				return False
 
 			position.entry_down_price = entry_price
 			position.down_size_usd = cost_usd
-			position.total_cost_usd += cost_with_fees
+			position.total_cost_usd += total_cost
 			position.entry_combined_price = position.entry_up_price + entry_price
 			position.second_leg_timestamp = datetime.now()
 			position.status = PositionStatus.OPEN
@@ -262,18 +302,18 @@ class LegInStrategy:
 			# Buy UP to match shares
 			entry_price = pair_quote.up_quote.price
 			cost_usd = shares_held * entry_price
-			cost_with_fees = cost_usd * (
-			    1.0 + self.config.trading_fee_percent / 100.0)
+			# No fees on Polymarket
+			total_cost = cost_usd
 
-			if cost_with_fees > available_capital:
+			if total_cost > available_capital:
 				logger.warning(
-				    f"Insufficient capital to complete hedge: need ${cost_with_fees:.2f}, have ${available_capital:.2f}"
+				    f"Insufficient capital to complete hedge: need ${total_cost:.2f}, have ${available_capital:.2f}"
 				)
 				return False
 
 			position.entry_up_price = entry_price
 			position.up_size_usd = cost_usd
-			position.total_cost_usd += cost_with_fees
+			position.total_cost_usd += total_cost
 			position.entry_combined_price = entry_price + position.entry_down_price
 			position.second_leg_timestamp = datetime.now()
 			position.status = PositionStatus.OPEN
@@ -332,8 +372,9 @@ class LegInStrategy:
 		if loss_ratio >= scratch_loss_threshold and completion_loss > 0.02:
 			return f"PRICE_CRASH:-{loss_ratio*100:.1f}%"
 
-		# CONDITION 3: Impossible hedge
-		if completion_loss > 0.08:
+		# CONDITION 3: Impossible hedge (reduced threshold to catch earlier)
+		# If completing would lose >5 cents per share, exit immediately
+		if completion_loss > 0.05:
 			return f"IMPOSSIBLE_HEDGE:loss>{completion_loss:.2f}"
 
 		return None
@@ -366,7 +407,7 @@ class LegInStrategy:
 				shares = position.down_size_usd / position.entry_down_price if position.entry_down_price > 0 else 0
 
 			# Potential payout if completed = shares × $1.00
-			# Potential cost = current cost + (shares × other_side_price × 1.02)
+			# Potential cost = current cost + (shares × other_side_price) - no fees
 			potential_profit_per_share = 1.0 - potential_unit_cost
 			position.unrealized_pnl_usd = shares * potential_profit_per_share
 
