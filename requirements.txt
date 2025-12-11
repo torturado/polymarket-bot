@@ -1,0 +1,7 @@
+requests
+pydantic
+python-dateutil
+urllib3
+py-clob-client
+websockets
+aiohttp
