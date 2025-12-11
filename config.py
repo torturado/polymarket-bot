@@ -23,10 +23,12 @@ class BotConfig:
 
 	# Market Filters
 	market_keywords: list[
-	    str] = None  # Keywords to filter BTC markets (e.g., ["BTC", "Bitcoin"])
+	    str] = None  # Keywords to filter markets (e.g., ["BTC", "ETH", "SOL", "XRP"])
 	market_duration_minutes: int = 15  # Target market duration in minutes
 	market_slug_pattern: Optional[
 	    str] = None  # Optional slug pattern (e.g., "btc-updown-15m")
+	supported_tokens: list[
+	    str] = None  # List of tokens to track (e.g., ["BTC", "ETH", "SOL", "XRP"])
 
 	# Strategy Parameters - Arbitrage Detection
 	# ═══════════════════════════════════════════════════════════════════════
@@ -58,7 +60,7 @@ class BotConfig:
 	# Max cost = 100 shares × $0.96 × 1.02 fee = ~$98
 	max_capital: float = 100.0  # Capital for one full arbitrage + margin
 	max_position_size: float = 40.0  # Target shares (100 shares = $100 payout)
-	max_concurrent_pairs: int = 1  # Maximum number of concurrent positions
+	max_concurrent_pairs: int = 11  # Maximum number of concurrent positions
 
 	# Fee Assumptions
 	trading_fee_percent: float = 2.0  # Trading fee percentage (2% taker fee)
@@ -74,11 +76,30 @@ class BotConfig:
 
 	def __post_init__(self):
 		"""Set default values for mutable fields."""
+		if self.supported_tokens is None:
+			self.supported_tokens = ["BTC", "ETH", "SOL", "XRP"]
+
 		if self.market_keywords is None:
-			self.market_keywords = [
-			    "BTC", "Bitcoin", "btc", "bitcoin", "15m", "15 min",
-			    "15-minute", "updown", "up down", "up or down"
-			]
+			# Build keywords from supported tokens
+			token_keywords = []
+			for token in self.supported_tokens:
+				token_lower = token.lower()
+				token_keywords.extend([token, token_lower])
+				# Add common names
+				if token == "BTC":
+					token_keywords.extend(["Bitcoin", "bitcoin"])
+				elif token == "ETH":
+					token_keywords.extend(["Ethereum", "ethereum"])
+				elif token == "SOL":
+					token_keywords.extend(["Solana", "solana"])
+				elif token == "XRP":
+					token_keywords.extend(["Ripple", "ripple"])
+
+			# Add common market keywords
+			token_keywords.extend([
+			    "15m", "15 min", "15-minute", "updown", "up down", "up or down"
+			])
+			self.market_keywords = token_keywords
 
 		# Load credentials from environment variables if not explicitly set
 		if self.api_key is None:

@@ -51,7 +51,7 @@ class PaperTradingEngine:
         """Initialize the engine by fetching market pairs and starting WebSocket."""
         logger.info("Initializing engine...")
 
-        # Start WebSocket client for real-time BTC up/down markets
+        # Start WebSocket client for real-time up/down markets
         if self.client.ws_client:
             self._start_websocket()
 
