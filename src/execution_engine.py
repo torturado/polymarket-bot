@@ -58,7 +58,7 @@ class ExecutionEngine:
             price=price,
             size=size,
             side="BUY",
-            order_type=OrderType.FAK,
+            order_type=OrderType.FOK,
         )
         try:
             await asyncio.to_thread(self.client.create_and_post_order, order_args)

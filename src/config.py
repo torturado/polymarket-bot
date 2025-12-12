@@ -83,6 +83,7 @@ class Config:
     min_opposite_ask_for_entry: float = 0.0
     min_book_depth_usdc: float = 0.0
     min_spread_basis_points: int = 0
+    max_entry_side_spread: float = 0.03
     book_depth_levels: int = 5
 
     # Paper Trading
@@ -172,6 +173,9 @@ class Config:
             min_book_depth_usdc=_get_float("MIN_BOOK_DEPTH_USDC", cls.min_book_depth_usdc),
             min_spread_basis_points=_get_int(
                 "MIN_SPREAD_BASIS_POINTS", cls.min_spread_basis_points
+            ),
+            max_entry_side_spread=_get_float(
+                "MAX_ENTRY_SIDE_SPREAD", cls.max_entry_side_spread
             ),
             book_depth_levels=_get_int("BOOK_DEPTH_LEVELS", cls.book_depth_levels),
             paper_trading=_get_bool("PAPER_TRADING", cls.paper_trading),

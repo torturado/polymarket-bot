@@ -249,7 +249,7 @@ class LegInBot:
                 "" if exit_cost is None else f" exit_cost={exit_cost:.4f}",
             )
 
-        if state == PositionState.CLOSING and not position.leg_2_filled:
+        if state == PositionState.CLOSING and not position.leg_2_filled and not position.leg_2_pending:
             opp_side = "NO" if position.leg_1_side == "YES" else "YES"
             price = update.prices[opp_side].best_ask
             size = position.leg_1_size
@@ -260,7 +260,11 @@ class LegInBot:
                 price,
                 size,
             )
-            await self.execution_engine.execute_leg_2(position, price=price, size=size)
+            position.leg_2_pending = True
+            try:
+                await self.execution_engine.execute_leg_2(position, price=price, size=size)
+            finally:
+                position.leg_2_pending = False
 
         if state == PositionState.UNWINDING:
             price = update.prices[position.leg_1_side].best_bid

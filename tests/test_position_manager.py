@@ -29,11 +29,18 @@ def _update(
 def test_evaluate_entry_yes():
     cfg = Config(entry_threshold=0.2, paper_trading=True)
     pm = PositionManager(cfg)
-    upd = _update(yes_ask=0.15, no_ask=0.85)
+    upd = _update(yes_ask=0.15, no_ask=0.85, yes_bid=0.14, no_bid=0.84)
     pos = pm.evaluate_entry(upd)
     assert pos is not None
     assert pos.leg_1_side == "YES"
     assert pos.state == PositionState.ENTERING_LEG_1
+
+
+def test_evaluate_entry_rejects_wide_spread():
+    cfg = Config(entry_threshold=0.2, paper_trading=True, max_entry_side_spread=0.03)
+    pm = PositionManager(cfg)
+    upd = _update(yes_ask=0.15, no_ask=0.85, yes_bid=0.1, no_bid=0.84)
+    assert pm.evaluate_entry(upd) is None
 
 
 def test_hold_to_close_and_merge():
@@ -72,4 +79,3 @@ def test_hold_to_unwind():
     upd = _update(yes_ask=0.61, no_ask=0.45)
     st = pm.update_position(pos, upd)
     assert st == PositionState.UNWINDING
-

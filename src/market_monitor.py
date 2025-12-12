@@ -121,9 +121,11 @@ class MarketMonitor:
         while True:
             current_markets = list(self.markets)
             token_to_condition: Dict[str, MarketSpec] = {}
+            condition_to_spec: Dict[str, MarketSpec] = {}
             for m in current_markets:
                 token_to_condition[m.yes_token_id] = m
                 token_to_condition[m.no_token_id] = m
+                condition_to_spec[m.condition_id] = m
 
             headers = self._build_ws_headers()
 
@@ -186,10 +188,18 @@ class MarketMonitor:
                             last_stats_at = time.time()
                             continue
 
+                        # If markets changed while we were awaiting recv(), don't
+                        # process stale messages from the old subscription.
+                        if self._resubscribe_event.is_set():
+                            self._resubscribe_event.clear()
+                            break
+
                         last_msg_at = time.time()
                         msgs += 1
 
                         for msg in self._iter_json_messages(raw):
+                            if self._resubscribe_event.is_set():
+                                break
                             if not isinstance(msg, dict):
                                 continue
 
@@ -200,7 +210,7 @@ class MarketMonitor:
                                 self._ingest_book_snapshot(msg, token_to_condition)
                                 if asset_id and asset_id in token_to_condition:
                                     spec = token_to_condition[asset_id]
-                                    yes_id, no_id = self.get_market_pair(spec.condition_id)
+                                    yes_id, no_id = spec.yes_token_id, spec.no_token_id
                                     yes_pd = self._price_data.get(yes_id)
                                     no_pd = self._price_data.get(no_id)
                                     if yes_pd and no_pd:
@@ -222,7 +232,7 @@ class MarketMonitor:
                             changes = msg.get("price_changes")
                             if changes:
                                 price_change_msgs += 1
-                                updated_conditions = set()
+                                updated_specs: Dict[str, MarketSpec] = {}
                                 now = time.time()
                                 for change in changes:
                                     asset_id = change.get("asset_id") or change.get("token_id")
@@ -240,10 +250,15 @@ class MarketMonitor:
                                     )
                                     self._price_data[asset_id] = pd
                                     spec = token_to_condition[asset_id]
-                                    updated_conditions.add(spec.condition_id)
+                                    updated_specs[spec.condition_id] = spec
 
-                                for cid in updated_conditions:
-                                    yes_id, no_id = self.get_market_pair(cid)
+                                for cid, spec in updated_specs.items():
+                                    if self._resubscribe_event.is_set():
+                                        break
+                                    # If the condition dropped from the latest specs
+                                    # (mid-resubscribe), just skip instead of crashing.
+                                    spec = condition_to_spec.get(cid, spec)
+                                    yes_id, no_id = spec.yes_token_id, spec.no_token_id
                                     yes_pd = self._price_data.get(yes_id)
                                     no_pd = self._price_data.get(no_id)
                                     if yes_pd and no_pd:
@@ -292,6 +307,10 @@ class MarketMonitor:
                                         "NO": self._ask_depth_usdc.get(spec.no_token_id, 0.0),
                                     },
                                 )
+
+                        if self._resubscribe_event.is_set():
+                            self._resubscribe_event.clear()
+                            break
 
                         if heartbeat_s > 0 and (time.time() - last_stats_at) >= heartbeat_s:
                             age = None if last_msg_at is None else time.time() - last_msg_at

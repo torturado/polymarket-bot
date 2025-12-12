@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Dict, Optional
 
 from .config import Config
-from .utils.market_utils import MarketUpdate, opposite_side, theoretical_spread
+from .utils.market_utils import MarketUpdate, opposite_side
 
 
 class PositionState(str, Enum):
@@ -32,6 +32,7 @@ class LegInPosition:
     leg_2_entry_price: Optional[float] = None
     leg_2_size: Optional[float] = None
     leg_2_filled: bool = False
+    leg_2_pending: bool = False
 
 
 class PositionManager:
@@ -73,6 +74,11 @@ class PositionManager:
         if self.config.min_spread_basis_points > 0:
             edge_bps = (1.0 - entry_exit_cost) * 10000.0
             if edge_bps < float(self.config.min_spread_basis_points):
+                return None
+
+        if self.config.max_entry_side_spread > 0:
+            my_side_bid = market_data.prices[side].best_bid
+            if (entry_price - my_side_bid) > self.config.max_entry_side_spread:
                 return None
 
         # Interpret MAX_POSITION_SIZE as USDC budget per leg (not shares).
@@ -126,7 +132,7 @@ class PositionManager:
     ) -> float:
         opp = opposite_side(position.leg_1_side)
         opp_ask = current_prices[opp].best_ask
-        return theoretical_spread(position.leg_1_entry_price, opp_ask)
+        return position.leg_1_entry_price + opp_ask
 
     def should_stop_loss(
         self, position: LegInPosition, current_prices: Dict[str, object]
