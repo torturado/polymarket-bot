@@ -47,6 +47,7 @@ class PolymarketRTDSClient:
 		                         Dict[str,
 		                              Any]] = {}  # asset_id -> market data
 		self.subscribed_assets: List[str] = []
+		self.subscribed_without_filters: bool = False  # Track if we subscribed without filters
 		self.callbacks: List[Callable] = []
 		self.last_update_timestamps: Dict[str,
 		                                  float] = {}  # asset_id -> timestamp
@@ -106,6 +107,24 @@ class PolymarketRTDSClient:
 		    f"🔔 subscribe_to_markets llamado con {len(asset_ids) if asset_ids else 0} asset_ids"
 		)
 
+		# If we already subscribed without filters, we don't need to resubscribe
+		# Without filters, we receive ALL market data, so resubscribing is unnecessary
+		# Check this FIRST before any async operations to prevent concurrent subscriptions
+		if self.subscribed_without_filters and self.websocket:
+			logger.info(
+			    "✅ Already subscribed without filters - no need to resubscribe (receiving all market data)"
+			)
+			# Update tracked assets but don't resubscribe
+			if asset_ids:
+				self.subscribed_assets = asset_ids
+			return True
+
+		# Mark that we're about to subscribe without filters IMMEDIATELY to prevent concurrent calls
+		# This prevents race conditions where multiple calls try to subscribe simultaneously
+		# We always subscribe without filters now, so set this flag early
+		if self.websocket:
+			self.subscribed_without_filters = True
+
 		# Ensure connection
 		try:
 			is_closed = self.websocket is None or self.websocket.state.name != "OPEN"
@@ -127,37 +146,48 @@ class PolymarketRTDSClient:
 		if not asset_ids:
 			asset_ids = await self._fetch_market_tokens()
 
+			# Check again after fetching tokens - another call might have subscribed in the meantime
+			if self.subscribed_without_filters and self.websocket:
+				logger.info(
+				    "✅ Already subscribed without filters (checked after fetching tokens) - no need to resubscribe"
+				)
+				if asset_ids:
+					self.subscribed_assets = asset_ids
+				return True
+
 		if not asset_ids:
 			logger.warning("No asset IDs to subscribe to")
 			return False
 
+		# Unsubscribe from previous subscriptions before subscribing to new ones
+		# RTDS requires unsubscribing before changing subscription filters
+		# But if we're already subscribed without filters, we don't need to unsubscribe/resubscribe
+		if self.subscribed_assets and self.websocket and not self.subscribed_without_filters:
+			try:
+				unsubscribe_msg = {"action": "unsubscribe"}
+				await self.websocket.send(json.dumps(unsubscribe_msg))
+				# Reset flag when unsubscribing
+				self.subscribed_without_filters = False
+				# Small delay to ensure unsubscribe is processed
+				await asyncio.sleep(0.1)
+			except Exception as e:
+				logger.warning(
+				    f"Failed to unsubscribe before resubscribe: {e}")
+
 		self.subscribed_assets = asset_ids
 
 		# Build RTDS subscription message
-		# According to RTDS docs, clob_market filters should be an array of asset IDs
-		# Limit to 100 assets per subscription for safety
-		filters = asset_ids[:100]
-		filters_json = json.dumps(filters)  # JSON-stringified array
+		# Since filters are optional per RTDS docs, try WITHOUT filters
+		# If no filters, we only need ONE subscription (not multiple batches)
+		# This avoids "Invalid request body" errors from too many subscriptions
+		# We'll receive all market data and filter client-side for the tokens we need
 
-		# Create subscriptions for different message types to get comprehensive market data
-		# RTDS WebSocket protocol: filters must be a JSON string
-		subscriptions = [
-		    {
-		        "topic": self.TOPIC_CLOB_MARKET,
-		        "type": "price_change",  # Real-time price updates
-		        "filters": filters_json
-		    },
-		    {
-		        "topic": self.TOPIC_CLOB_MARKET,
-		        "type": "agg_orderbook",  # Order book data
-		        "filters": filters_json
-		    },
-		    {
-		        "topic": self.TOPIC_CLOB_MARKET,
-		        "type": "last_trade_price",  # Last trade prices
-		        "filters": filters_json
-		    }
-		]
+		# Create single subscription without filters
+		subscriptions = [{
+		    "topic": self.TOPIC_CLOB_MARKET,
+		    "type": "agg_orderbook"  # Order book data (bids/asks)
+		    # No filters - RTDS will send all market data, we filter client-side
+		}]
 
 		# Add authentication if available (improves rate limits)
 		clob_auth = self._get_clob_auth()
@@ -170,21 +200,24 @@ class PolymarketRTDSClient:
 
 		try:
 			subscription_json = json.dumps(subscribe_msg)
+			# Flag already set earlier to prevent concurrent subscriptions
 			await self.websocket.send(subscription_json)
+
 			logger.info(
-			    f"📡 RTDS: Subscribed to {len(asset_ids)} market tokens")
-			logger.info(
-			    f"  📤 Mensaje de suscripción enviado: {subscription_json}")
+			    f"📡 RTDS: Subscribed to all markets (no filters) - will filter client-side for {len(asset_ids)} tokens"
+			)
 
 			# Log asset IDs for debugging
 			if asset_ids:
 				logger.info(
-				    f"  📋 Asset IDs para suscripción RTDS: {asset_ids[:10]}")
-				logger.info(f"  📋 Total: {len(asset_ids)} asset IDs")
+				    f"  📋 Tracking {len(asset_ids)} asset IDs client-side")
+				logger.info(f"  📋 Sample IDs: {asset_ids[:5]}")
 
 			return True
 		except Exception as e:
 			logger.error(f"Failed to subscribe to RTDS: {e}")
+			# Reset flag on error so we can retry
+			self.subscribed_without_filters = False
 			self.websocket = None
 			return False
 
@@ -553,10 +586,21 @@ class PolymarketRTDSClient:
 				)
 			return
 
+		# Filter: Only process orderbooks for assets we're tracking (current up/down markets)
+		# Since we subscribe without filters, we receive ALL market data, but we only want current markets
+		if self.subscribed_assets and asset_id not in self.subscribed_assets:
+			# Skip this orderbook - it's not one of our tracked assets (might be old/future market)
+			if self._message_count <= 20:
+				logger.debug(
+				    f"  ⏭️ Skipping orderbook for untracked asset_id: {asset_id[:20]}... (not in subscribed_assets)"
+				)
+			return
+
 		# Log successful processing for first few items
 		if self._message_count <= 5:
 			logger.info(
-			    f"  ✅ Processing orderbook for asset_id: {asset_id[:20]}...")
+			    f"  ✅ Processing orderbook for asset_id: {asset_id[:20]}... (tracked asset)"
+			)
 
 		bids = payload.get("bids", [])
 		asks = payload.get("asks", [])

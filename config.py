@@ -45,7 +45,7 @@ class BotConfig:
 	complete_threshold: float = 0.95
 
 	# RESTAURAR LÓGICA ESTRICTA: Nunca entrar si la suma > 1.00
-	max_entry_threshold: float = 1.00
+	max_entry_threshold: float = 0.96
 
 	# Exigir un beneficio mínimo del 2% al proyectar el cierre
 	min_profit_pct: float = 2.0
