@@ -42,6 +42,9 @@ class PositionManager:
         yes_ask = market_data.prices["YES"].best_ask
         no_ask = market_data.prices["NO"].best_ask
 
+        if max(yes_ask, no_ask) > self.config.max_opposite_ask_for_entry:
+            return None
+
         candidates = []
         if yes_ask < self.config.entry_threshold:
             candidates.append(("YES", yes_ask, no_ask))
@@ -55,13 +58,25 @@ class PositionManager:
 
         if opp_ask > self.config.max_opposite_ask_for_entry:
             return None
+        if self.config.min_opposite_ask_for_entry > 0 and opp_ask < self.config.min_opposite_ask_for_entry:
+            return None
 
-        if self.config.max_entry_exit_cost is not None:
-            entry_exit_cost = entry_price + opp_ask
-            if entry_exit_cost > self.config.max_entry_exit_cost:
+        if self.config.min_book_depth_usdc > 0:
+            depth_yes = market_data.book_depth_usdc.get("YES", 0.0)
+            depth_no = market_data.book_depth_usdc.get("NO", 0.0)
+            if depth_yes < self.config.min_book_depth_usdc or depth_no < self.config.min_book_depth_usdc:
                 return None
 
-        size = min(self.config.max_position_size, 1.0)  # placeholder sizing
+        entry_exit_cost = entry_price + opp_ask
+        if self.config.max_entry_exit_cost is not None and entry_exit_cost > self.config.max_entry_exit_cost:
+            return None
+        if self.config.min_spread_basis_points > 0:
+            edge_bps = (1.0 - entry_exit_cost) * 10000.0
+            if edge_bps < float(self.config.min_spread_basis_points):
+                return None
+
+        # Interpret MAX_POSITION_SIZE as USDC budget per leg (not shares).
+        size = self.config.max_position_size / entry_price if entry_price > 0 else 0.0
 
         return LegInPosition(
             condition_id=market_data.condition_id,

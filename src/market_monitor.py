@@ -30,6 +30,7 @@ class MarketMonitor:
         self.set_markets(markets, trigger_resubscribe=False)
         self._prices: Dict[str, Optional[float]] = {}
         self._price_data: Dict[str, Optional[object]] = {}
+        self._ask_depth_usdc: Dict[str, float] = {}
 
     def set_markets(self, markets: List[MarketSpec], *, trigger_resubscribe: bool = True) -> None:
         """
@@ -59,6 +60,7 @@ class MarketMonitor:
 
     async def _monitor_via_polling(self) -> AsyncIterator[MarketUpdate]:
         interval = self.config.polling_interval_ms / 1000.0
+        depth_levels = max(int(self.config.book_depth_levels), 0)
         token_ids: List[str] = []
         for m in self.markets:
             token_ids.extend([m.yes_token_id, m.no_token_id])
@@ -74,6 +76,11 @@ class MarketMonitor:
                     pd = best_prices_from_orderbook(ob)
                     self._price_data[token_id] = pd
                     price_map[token_id] = pd
+                    if depth_levels > 0:
+                        asks = getattr(ob, "asks", None) or []
+                        self._ask_depth_usdc[token_id] = self._compute_ask_depth_usdc(
+                            asks, depth_levels
+                        )
 
                 for m in self.markets:
                     yes_pd = price_map.get(m.yes_token_id)
@@ -86,6 +93,10 @@ class MarketMonitor:
                         no_token_id=m.no_token_id,
                         prices={"YES": yes_pd, "NO": no_pd},
                         received_at=now,
+                        book_depth_usdc={
+                            "YES": self._ask_depth_usdc.get(m.yes_token_id, 0.0),
+                            "NO": self._ask_depth_usdc.get(m.no_token_id, 0.0),
+                        },
                     )
                     yield update
             except Exception as e:
@@ -200,6 +211,10 @@ class MarketMonitor:
                                             no_token_id=no_id,
                                             prices={"YES": yes_pd, "NO": no_pd},
                                             received_at=time.time(),
+                                            book_depth_usdc={
+                                                "YES": self._ask_depth_usdc.get(yes_id, 0.0),
+                                                "NO": self._ask_depth_usdc.get(no_id, 0.0),
+                                            },
                                         )
                                 continue
 
@@ -239,6 +254,10 @@ class MarketMonitor:
                                             no_token_id=no_id,
                                             prices={"YES": yes_pd, "NO": no_pd},
                                             received_at=now,
+                                            book_depth_usdc={
+                                                "YES": self._ask_depth_usdc.get(yes_id, 0.0),
+                                                "NO": self._ask_depth_usdc.get(no_id, 0.0),
+                                            },
                                         )
                                 continue
 
@@ -268,6 +287,10 @@ class MarketMonitor:
                                     no_token_id=spec.no_token_id,
                                     prices={"YES": yes_pd, "NO": no_pd},
                                     received_at=time.time(),
+                                    book_depth_usdc={
+                                        "YES": self._ask_depth_usdc.get(spec.yes_token_id, 0.0),
+                                        "NO": self._ask_depth_usdc.get(spec.no_token_id, 0.0),
+                                    },
                                 )
 
                         if heartbeat_s > 0 and (time.time() - last_stats_at) >= heartbeat_s:
@@ -317,6 +340,7 @@ class MarketMonitor:
             return
         bids = msg.get("bids") or []
         asks = msg.get("asks") or []
+        depth_levels = max(int(self.config.book_depth_levels), 0)
         try:
             best_bid = max(float(b["price"]) for b in bids) if bids else 0.0
             best_ask = min(float(a["price"]) for a in asks) if asks else 0.0
@@ -328,6 +352,33 @@ class MarketMonitor:
         self._price_data[asset_id] = PriceData(
             best_bid=best_bid, best_ask=best_ask, timestamp=now
         )
+        if depth_levels > 0:
+            self._ask_depth_usdc[asset_id] = self._compute_ask_depth_usdc(
+                asks, depth_levels
+            )
+
+    @staticmethod
+    def _compute_ask_depth_usdc(levels: List[Any], max_levels: int) -> float:
+        if max_levels <= 0:
+            return 0.0
+        entries = []
+        for level in levels:
+            if isinstance(level, dict):
+                price = level.get("price")
+                size = level.get("size")
+            else:  # py-clob-client orderbook levels
+                price = getattr(level, "price", None)
+                size = getattr(level, "size", None)
+            try:
+                price_f = float(price)
+                size_f = float(size)
+            except Exception:
+                continue
+            if price_f <= 0 or size_f <= 0:
+                continue
+            entries.append((price_f, size_f))
+        entries.sort(key=lambda t: t[0])
+        return sum(price * size for price, size in entries[:max_levels])
 
     @staticmethod
     def _iter_json_messages(raw: str) -> List[Any]:

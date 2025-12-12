@@ -20,7 +20,11 @@ Edita `.env` (mira `.env.example`). Imprescindible:
 - `MARKET_FILTER_REGEX` si quieres filtrar, ej. `(?i)xrp-updown-15m-\\d+`.
 - `MARKET_FILTER_CURRENT_WINDOW=true` para quedarte solo con la ventana 15m actual (ET).
 - Para evitar loops de re‑entry: `MAX_ENTRIES_PER_CONDITION`, `REENTRY_COOLDOWN_S`, `ENTRY_SIGNAL_MIN_INTERVAL_MS`.
-- Para filtrar entradas “muertas”: `MAX_OPPOSITE_ASK_FOR_ENTRY` (y opcional `MAX_ENTRY_EXIT_COST`).
+- Para filtrar entradas “muertas”: `MAX_OPPOSITE_ASK_FOR_ENTRY` (o alias `NO_ENTRY_IF_EITHER_ASK_ABOVE`), y opcional `MAX_ENTRY_EXIT_COST`.
+- Filtros conservadores extra: `MIN_OPPOSITE_ASK`, `MIN_BOOK_DEPTH_USDC`, `MIN_SPREAD_BASIS_POINTS` (requiere book snapshots del WS).
+- Circuit breaker: `MAX_DAILY_LOSS` (bloquea nuevas entradas hasta el próximo día UTC).
+- `MAX_POSITION_SIZE` se interpreta como presupuesto USDC por patita (`size = budget / price`).
+- `POLYMARKET_WS_HEADERS` / `POLYMARKET_WS_COOKIES` se pasan como JSON (mira `.env.example`).
 
 **3) Auto‑actualizar markets**
 Este script consulta Gamma API (tag `15M`) y escribe `market_specs.json` cada 15m (por defecto).

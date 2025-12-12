@@ -31,6 +31,7 @@ DEFAULT_MARKET_TIMEZONE = "America/New_York"
 DEFAULT_WINDOW_MINUTES = 15
 
 _EPOCH_SUFFIX_RE = re.compile(r"-(\d{9,})$")
+_TAG_MINUTES_RE = re.compile(r"^(\d+)\s*[mM]$")
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,11 @@ class ScanStats:
     window_start_local: Optional[str] = None
     window_end_local: Optional[str] = None
     window_start_epoch_utc: Optional[int] = None
+    window_tz: Optional[str] = None
+    window_minutes: Optional[int] = None
+    window_minutes_env: Optional[int] = None
+    window_minutes_inferred: Optional[int] = None
+    gamma_tag_slug: Optional[str] = None
 
 
 def _iter_pages(
@@ -141,6 +147,21 @@ def _parse_iso8601_to_epoch(value: Any) -> Optional[int]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=_dt.timezone.utc)
     return int(dt.timestamp())
+
+
+def _infer_window_minutes_from_tag_slug(tag_slug: Any) -> Optional[int]:
+    if not isinstance(tag_slug, str):
+        return None
+    m = _TAG_MINUTES_RE.match(tag_slug.strip())
+    if not m:
+        return None
+    try:
+        minutes = int(m.group(1))
+    except Exception:
+        return None
+    if minutes <= 0 or 60 % minutes != 0:
+        return None
+    return minutes
 
 
 def _fetch_json(url: str, *, timeout_s: int = 30) -> Any:
@@ -392,7 +413,9 @@ def build_market_specs(
             "on",
         }
         window_tz = os.getenv("MARKET_TIMEZONE", DEFAULT_MARKET_TIMEZONE)
-        window_minutes = int(os.getenv("MARKET_WINDOW_MINUTES", str(DEFAULT_WINDOW_MINUTES)))
+        window_minutes_env = int(os.getenv("MARKET_WINDOW_MINUTES", str(DEFAULT_WINDOW_MINUTES)))
+        window_minutes_inferred = _infer_window_minutes_from_tag_slug(tag_slug)
+        window_minutes = window_minutes_inferred or window_minutes_env
         window_start_epoch_utc: Optional[int] = None
         if filter_current_window:
             ws, we, epoch = _compute_current_window(
@@ -402,6 +425,11 @@ def build_market_specs(
             stats.window_start_local = ws.isoformat()
             stats.window_end_local = we.isoformat()
             stats.window_start_epoch_utc = epoch
+            stats.window_tz = window_tz
+            stats.window_minutes = window_minutes
+            stats.window_minutes_env = window_minutes_env
+            stats.window_minutes_inferred = window_minutes_inferred
+            stats.gamma_tag_slug = tag_slug
             window_start_epoch_utc = epoch
 
         for event in _iter_gamma_events(
@@ -554,6 +582,10 @@ def write_specs(path: str, specs: List[Dict[str, str]]) -> None:
 
 
 def main() -> None:
+    # Load `.env` early so argparse defaults can read values like
+    # MARKET_UPDATE_INTERVAL_S without requiring the user to export them.
+    config = Config.from_env()
+
     parser = argparse.ArgumentParser(description="Update market_specs.json for LegInBot.")
     parser.add_argument(
         "--once", action="store_true", help="Run one update and exit."
@@ -612,8 +644,6 @@ def main() -> None:
     args = parser.parse_args()
 
     filter_re = re.compile(args.filter_regex, re.IGNORECASE) if args.filter_regex else None
-
-    config = Config.from_env()
     client = ClobClient(host=config.host, chain_id=config.chain_id)
 
     while True:
@@ -652,6 +682,25 @@ def main() -> None:
                 f"{stats.window_start_local} -> {stats.window_end_local} "
                 f"(start_epoch_utc={stats.window_start_epoch_utc}, window_matched={stats.window_matched})"
             )
+            if (
+                stats.window_minutes_inferred is not None
+                and stats.window_minutes_env is not None
+                and stats.window_minutes_inferred != stats.window_minutes_env
+            ):
+                print(
+                    f"NOTE: MARKET_WINDOW_MINUTES={stats.window_minutes_env} pero GAMMA_TAG_SLUG={stats.gamma_tag_slug}. "
+                    f"Usando {stats.window_minutes_inferred}m por el tag."
+                )
+            if (
+                stats.gamma_tag_slug
+                and stats.window_minutes
+                and stats.gamma_tag_slug.upper() == "15M"
+                and stats.window_minutes != 15
+            ):
+                print(
+                    f"WARNING: GAMMA_TAG_SLUG={stats.gamma_tag_slug} pero MARKET_WINDOW_MINUTES={stats.window_minutes}. "
+                    "Para 15M debería ser 15."
+                )
 
         if specs:
             write_specs(args.output, specs)
@@ -675,7 +724,33 @@ def main() -> None:
 
         if args.once:
             break
-        time.sleep(args.interval)
+
+        # Scheduler:
+        # - Always respect `--interval` / MARKET_UPDATE_INTERVAL_S as the maximum
+        #   time between updates.
+        # - If we're filtering Gamma 15m markets to the "current window", wake
+        #   up at the next window boundary (so the file updates immediately when
+        #   the ticker epoch changes).
+        sleep_s = float(args.interval)
+        if args.source == "gamma_15m" and stats.window_end_local:
+            grace_s = float(os.getenv("MARKET_WINDOW_GRACE_S", "2"))
+            try:
+                window_end = _dt.datetime.fromisoformat(stats.window_end_local)
+                next_boundary_at = window_end.timestamp() + grace_s
+                if sleep_s <= 0:
+                    sleep_until = next_boundary_at
+                else:
+                    sleep_until = min(time.time() + sleep_s, next_boundary_at)
+                sleep_s = max(0.0, sleep_until - time.time())
+            except Exception:
+                sleep_s = max(0.0, sleep_s)
+        elif sleep_s < 0:
+            sleep_s = 0.0
+
+        if args.debug:
+            print(f"Next update in {sleep_s:.1f}s")
+
+        time.sleep(sleep_s)
 
 
 if __name__ == "__main__":

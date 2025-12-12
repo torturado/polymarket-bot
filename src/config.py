@@ -80,6 +80,10 @@ class Config:
     min_market_volatility: float = 0.05
     max_opposite_ask_for_entry: float = 0.95
     max_entry_exit_cost: Optional[float] = None
+    min_opposite_ask_for_entry: float = 0.0
+    min_book_depth_usdc: float = 0.0
+    min_spread_basis_points: int = 0
+    book_depth_levels: int = 5
 
     # Paper Trading
     paper_trading: bool = True
@@ -154,13 +158,22 @@ class Config:
                 "MIN_MARKET_VOLATILITY", cls.min_market_volatility
             ),
             max_opposite_ask_for_entry=_get_float(
-                "MAX_OPPOSITE_ASK_FOR_ENTRY", cls.max_opposite_ask_for_entry
+                "MAX_OPPOSITE_ASK_FOR_ENTRY",
+                _get_float("NO_ENTRY_IF_EITHER_ASK_ABOVE", cls.max_opposite_ask_for_entry),
             ),
             max_entry_exit_cost=(
                 _get_float("MAX_ENTRY_EXIT_COST", 0.0)
                 if _get_env("MAX_ENTRY_EXIT_COST") is not None
                 else cls.max_entry_exit_cost
             ),
+            min_opposite_ask_for_entry=_get_float(
+                "MIN_OPPOSITE_ASK", cls.min_opposite_ask_for_entry
+            ),
+            min_book_depth_usdc=_get_float("MIN_BOOK_DEPTH_USDC", cls.min_book_depth_usdc),
+            min_spread_basis_points=_get_int(
+                "MIN_SPREAD_BASIS_POINTS", cls.min_spread_basis_points
+            ),
+            book_depth_levels=_get_int("BOOK_DEPTH_LEVELS", cls.book_depth_levels),
             paper_trading=_get_bool("PAPER_TRADING", cls.paper_trading),
             paper_trades_log=_get_env("PAPER_TRADES_LOG", cls.paper_trades_log),
             max_concurrent_positions=_get_int(
@@ -170,9 +183,13 @@ class Config:
             max_entries_per_condition=_get_int(
                 "MAX_ENTRIES_PER_CONDITION", cls.max_entries_per_condition
             ),
-            reentry_cooldown_s=_get_float("REENTRY_COOLDOWN_S", cls.reentry_cooldown_s),
+            reentry_cooldown_s=_get_float(
+                "REENTRY_COOLDOWN_S",
+                _get_float("PER_CONDITION_LOCK_SECONDS", cls.reentry_cooldown_s),
+            ),
             entry_signal_min_interval_ms=_get_int(
-                "ENTRY_SIGNAL_MIN_INTERVAL_MS", cls.entry_signal_min_interval_ms
+                "ENTRY_SIGNAL_MIN_INTERVAL_MS",
+                _get_int("SIGNAL_COOLDOWN_MS", cls.entry_signal_min_interval_ms),
             ),
             polling_interval_ms=_get_int(
                 "POLLING_INTERVAL_MS", cls.polling_interval_ms

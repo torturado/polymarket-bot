@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 
@@ -31,6 +31,9 @@ class MarketUpdate:
     no_token_id: str
     prices: Dict[str, PriceData]  # keys: "YES", "NO"
     received_at: float
+    # Cached depth (USDC) from the latest orderbook snapshot, per side.
+    # By default this is empty; WS mode fills it from "book" snapshots.
+    book_depth_usdc: Dict[str, float] = field(default_factory=dict)
 
 
 def best_prices_from_orderbook(orderbook) -> Optional[PriceData]:
@@ -69,4 +72,3 @@ def opposite_side(side: str) -> str:
     if s == "NO":
         return "YES"
     raise ValueError(f"Unknown side: {side}")
-

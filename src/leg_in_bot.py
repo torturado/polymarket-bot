@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as _dt
 import json
 import logging
 import time
@@ -59,6 +60,9 @@ class LegInBot:
         self._cooldown_until: Dict[str, float] = {}
         self._entry_counts: Dict[str, int] = {}
         self._last_entry_signal_at: Dict[str, float] = {}
+        self._daily_pnl_usdc: float = 0.0
+        self._daily_pnl_day_utc = _dt.datetime.now(_dt.timezone.utc).date()
+        self._daily_loss_tripped: bool = False
 
         # If using MARKET_SPECS_FILE, keep the file list separate from the
         # effective list (file + pinned open positions).
@@ -148,6 +152,16 @@ class LegInBot:
             )
 
     def _entry_allowed(self, condition_id: str, now: float) -> bool:
+        self._roll_daily_pnl(now)
+        if self.config.max_daily_loss > 0 and self._daily_pnl_usdc <= -float(self.config.max_daily_loss):
+            if not self._daily_loss_tripped:
+                self._daily_loss_tripped = True
+                self.logger.warning(
+                    "Daily loss limit reached: pnl=%.4f <= -%.4f; disabling new entries until next UTC day",
+                    self._daily_pnl_usdc,
+                    float(self.config.max_daily_loss),
+                )
+            return False
         if self.config.max_concurrent_positions > 0 and len(self.positions) >= self.config.max_concurrent_positions:
             return False
         if now < self._cooldown_until.get(condition_id, 0.0):
@@ -160,6 +174,25 @@ class LegInBot:
         if last is not None and interval_s > 0 and (now - last) < interval_s:
             return False
         return True
+
+    def _roll_daily_pnl(self, now: float) -> None:
+        day = _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc).date()
+        if day != self._daily_pnl_day_utc:
+            self._daily_pnl_day_utc = day
+            self._daily_pnl_usdc = 0.0
+            self._daily_loss_tripped = False
+
+    def _record_pnl(self, pnl_usdc: float, *, condition_id: str, action: str) -> None:
+        now = time.time()
+        self._roll_daily_pnl(now)
+        self._daily_pnl_usdc += float(pnl_usdc)
+        self.logger.info(
+            "PNL condition=%s action=%s pnl=%.4f daily_pnl=%.4f",
+            condition_id,
+            action,
+            float(pnl_usdc),
+            self._daily_pnl_usdc,
+        )
 
     def _finish_position(self, condition_id: str) -> None:
         self.positions.pop(condition_id, None)
@@ -238,15 +271,29 @@ class LegInBot:
                 price,
                 position.leg_1_size,
             )
-            await self.execution_engine.execute_unwind(
+            ok = await self.execution_engine.execute_unwind(
                 position, price=price, size=position.leg_1_size
             )
-            self._finish_position(cid)
+            if ok:
+                pnl = (price - position.leg_1_entry_price) * position.leg_1_size
+                self._record_pnl(pnl, condition_id=cid, action="UNWIND")
+                self._finish_position(cid)
+            else:
+                self.logger.warning("UNWIND failed condition=%s; keeping position open", cid)
 
         if state == PositionState.MERGING:
             self.logger.info("MERGE condition=%s", cid)
-            await self.execution_engine.merge_tokens(position)
-            self._finish_position(cid)
+            ok = await self.execution_engine.merge_tokens(position)
+            if ok:
+                leg_2_price = position.leg_2_entry_price
+                if leg_2_price is not None:
+                    pnl = (1.0 - position.leg_1_entry_price - leg_2_price) * position.leg_1_size
+                    self._record_pnl(pnl, condition_id=cid, action="MERGE")
+                else:
+                    self.logger.warning("MERGE pnl unknown (missing leg_2_entry_price) condition=%s", cid)
+                self._finish_position(cid)
+            else:
+                self.logger.warning("MERGE failed condition=%s; keeping position open", cid)
 
 
 async def main() -> None:
