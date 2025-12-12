@@ -77,6 +77,10 @@ class BotConfig:
 	polling_interval_seconds: float = 0.2  # Ultra-fast polling (was 0.5), no API limits with WebSocket cache
 	min_time_remaining_seconds: int = 240  # Don't enter with less than 3 minutes left
 
+	# Debug/Logging Settings
+	raw_message_log_limit: int = 10  # Log first N raw WebSocket messages at DEBUG level (0 = disabled, -1 = unlimited)
+	raw_message_log_sample_interval: int = 100  # After limit, log every Nth message (0 = no sampling)
+
 	# Reporting
 	log_to_csv: bool = True
 	csv_output_path: str = "paper_trades.csv"

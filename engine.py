@@ -46,6 +46,8 @@ class PaperTradingEngine:
 		self.market_pairs: list[MarketPair] = []
 		self.pnl_history: list[PnLRecord] = []
 		self.running = False
+		self.stored_ws_loop: Optional[
+		    asyncio.AbstractEventLoop] = None  # WebSocket event loop
 
 		# Statistics
 		self.total_trades = 0
@@ -96,6 +98,8 @@ class PaperTradingEngine:
 		def run_ws():
 			loop = asyncio.new_event_loop()
 			asyncio.set_event_loop(loop)
+			# Store the event loop so we can schedule coroutines on it later
+			self.stored_ws_loop = loop
 			loop.run_until_complete(ws_loop())
 
 		self.ws_thread = threading.Thread(target=run_ws, daemon=True)
@@ -244,21 +248,29 @@ class PaperTradingEngine:
 			    f"🔌 Resuscribiendo WebSocket a {len(all_tokens)} tokens: {tokens_preview}..."
 			)
 
-			# Run subscription in the WebSocket's event loop
-			if self.client.ws_client.websocket:
-				loop = asyncio.new_event_loop()
-
-				async def resubscribe():
-					await self.client.ws_client.subscribe_to_markets(all_tokens
-					                                                 )
-
-				# Run in separate thread to avoid blocking
-				def run_async():
-					asyncio.set_event_loop(loop)
-					loop.run_until_complete(resubscribe())
-
-				thread = threading.Thread(target=run_async, daemon=True)
-				thread.start()
+			# Run subscription in the WebSocket's event loop using run_coroutine_threadsafe
+			if self.client.ws_client.websocket and self.stored_ws_loop:
+				try:
+					future = asyncio.run_coroutine_threadsafe(
+					    self.client.ws_client.subscribe_to_markets(all_tokens),
+					    self.stored_ws_loop)
+					# Optionally wait for result with timeout, but don't block indefinitely
+					# The future will complete in the WebSocket's thread
+					result = future.result(timeout=10.0)
+					if result:
+						logger.info("✅ WebSocket resubscription successful")
+					else:
+						logger.warning(
+						    "⚠️ WebSocket resubscription returned False")
+				except asyncio.TimeoutError:
+					logger.error(
+					    "Timeout waiting for WebSocket resubscription")
+				except Exception as e:
+					logger.error(f"Error resuscribiendo WebSocket: {e}",
+					             exc_info=True)
+			elif not self.stored_ws_loop:
+				logger.warning(
+				    "WebSocket event loop not available, cannot resubscribe")
 
 		except Exception as e:
 			logger.error(f"Error resuscribiendo WebSocket: {e}")
@@ -295,22 +307,22 @@ class PaperTradingEngine:
 			up_data = self.client.ws_client.get_instant_quote(up_token)
 			down_data = self.client.ws_client.get_instant_quote(down_token)
 
-			if up_data and down_data:
-				# Use best ASK for buying (what we'd pay)
-				up_bid, up_ask = up_data
-				down_bid, down_ask = down_data
+		if up_data and down_data:
+			# Use best ASK for buying (what we'd pay)
+			up_bid, up_ask = up_data
+			down_bid, down_ask = down_data
 
-				up_quote = Quote(
-				    market_id=pair.up_market.market_id,
-				    side=MarketSide.UP,
-				    price=up_ask,  # Use ASK for buying
-				    timestamp=datetime.now())
-				down_quote = Quote(
-				    market_id=pair.down_market.market_id,
-				    side=MarketSide.DOWN,
-				    price=down_ask,  # Use ASK for buying
-				    timestamp=datetime.now())
-				return (up_quote, down_quote)
+			up_quote = Quote(
+			    market_id=pair.up_market.market_id,
+			    side=MarketSide.UP,
+			    price=up_ask,  # Use ASK for buying
+			    timestamp=datetime.now(timezone.utc))
+			down_quote = Quote(
+			    market_id=pair.down_market.market_id,
+			    side=MarketSide.DOWN,
+			    price=down_ask,  # Use ASK for buying
+			    timestamp=datetime.now(timezone.utc))
+			return (up_quote, down_quote)
 
 		# Fallback to HTTP (slower but more reliable)
 		return self.client.get_pair_quotes(pair)
@@ -415,8 +427,8 @@ class PaperTradingEngine:
 					available_capital = self.config.max_capital - total_capital_deployed
 
 		# Log status every 6 iterations (~30 seconds)
-		self._iteration_count += 1
-		if self._iteration_count % 6 == 0 and self.market_pairs:
+		# Note: Counter is incremented in _iteration() after this method returns
+		if (self._iteration_count + 1) % 6 == 0 and self.market_pairs:
 			current_pair = self.market_pairs[0]
 			time_info = ""
 			if hasattr(current_pair, '_end_date') and current_pair._end_date:
@@ -502,7 +514,7 @@ class PaperTradingEngine:
 
 				position.realized_pnl_usd = realized_pnl
 				position.status = PositionStatus.RESOLVED
-				position.exit_timestamp = now
+				position.exit_timestamp = now.replace(tzinfo=timezone.utc)
 
 				self.total_realized_pnl += realized_pnl
 
@@ -554,7 +566,7 @@ class PaperTradingEngine:
 		total_pnl = total_realized + total_unrealized
 		total_deployed = sum(p.total_cost_usd for p in open_positions)
 
-		record = PnLRecord(timestamp=datetime.now(),
+		record = PnLRecord(timestamp=datetime.now(timezone.utc),
 		                   total_realized_pnl_usd=total_realized,
 		                   total_unrealized_pnl_usd=total_unrealized,
 		                   total_pnl_usd=total_pnl,
@@ -675,7 +687,7 @@ class PaperTradingEngine:
 		# Update position status
 		position.status = PositionStatus.SCRATCHED
 		position.realized_pnl_usd = pnl
-		position.exit_timestamp = datetime.now()
+		position.exit_timestamp = datetime.now(timezone.utc)
 
 		# Update engine totals
 		self.total_realized_pnl += pnl

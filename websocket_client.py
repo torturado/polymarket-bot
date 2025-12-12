@@ -220,14 +220,33 @@ class PolymarketRTDSClient:
 
 					data = json.loads(message)
 
-					# Log first few raw messages to debug
+					# Log raw messages at DEBUG level with configurable limits
+					# Keep counter logic (initialize if missing and increment)
 					if not hasattr(self, '_raw_message_count'):
 						self._raw_message_count = 0
 					self._raw_message_count += 1
-					# Log ALL messages (no limit) to debug why we're not receiving data
-					logger.info(
-					    f"📥 Raw message #{self._raw_message_count}: {str(message)[:500]}..."
-					)
+
+					# Only log if DEBUG is enabled and conditions are met
+					if logger.isEnabledFor(logging.DEBUG):
+						should_log = False
+						limit = self.config.raw_message_log_limit
+						sample_interval = self.config.raw_message_log_sample_interval
+
+						if limit > 0:
+							# Log first N messages
+							if self._raw_message_count <= limit:
+								should_log = True
+							# After limit, sample every Mth message if sampling enabled
+							elif sample_interval > 0 and self._raw_message_count % sample_interval == 0:
+								should_log = True
+						elif limit == -1:
+							# Unlimited logging (for debugging)
+							should_log = True
+
+						if should_log:
+							logger.debug(
+							    f"📥 Raw message #{self._raw_message_count}: {str(message)[:500]}..."
+							)
 
 					await self._process_message(data)
 				except json.JSONDecodeError as e:
@@ -659,7 +678,7 @@ class PolymarketRTDSClient:
 									try:
 										token_list = json.loads(clob_token_ids)
 										token_ids.extend(token_list)
-									except:
+									except (json.JSONDecodeError, TypeError):
 										pass
 								elif isinstance(clob_token_ids, list):
 									token_ids.extend(clob_token_ids)
