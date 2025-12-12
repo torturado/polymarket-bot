@@ -282,33 +282,36 @@ class PolymarketClient:
 					# 2. Have exactly 2 outcomes (UP/DOWN pairs)
 					# 3. Outcomes contain "Up" and "Down" (case-insensitive)
 
-				# Parse outcomes first
-				outcomes_raw = market_data.get("outcomes", [])
-				outcomes = []
-				if isinstance(outcomes_raw, str):
-					try:
-						outcomes = json.loads(outcomes_raw)
-					except (json.JSONDecodeError, ValueError, TypeError) as e:
-						outcomes = []
-						logger.debug(f"Failed to parse outcomes JSON: {e}")
-				elif isinstance(outcomes_raw, list):
-					outcomes = outcomes_raw
+					# Parse outcomes first
+					outcomes_raw = market_data.get("outcomes", [])
+					outcomes = []
+					if isinstance(outcomes_raw, str):
+						try:
+							outcomes = json.loads(outcomes_raw)
+						except (json.JSONDecodeError, ValueError,
+						        TypeError) as e:
+							outcomes = []
+							logger.debug(f"Failed to parse outcomes JSON: {e}")
+					elif isinstance(outcomes_raw, list):
+						outcomes = outcomes_raw
 
 					# Must have exactly 2 outcomes for UP/DOWN markets
 					if len(outcomes) != 2:
 						continue
 
-				# Extract token IDs from clobTokenIds (must exist for CLOB markets)
-				token_ids = []
-				clob_token_ids_raw = market_data.get("clobTokenIds", "")
-				if isinstance(clob_token_ids_raw, str):
-					try:
-						token_ids = json.loads(clob_token_ids_raw)
-					except (json.JSONDecodeError, ValueError, TypeError) as e:
-						token_ids = []
-						logger.debug(f"Failed to parse clobTokenIds JSON: {e}")
-				elif isinstance(clob_token_ids_raw, list):
-					token_ids = clob_token_ids_raw
+					# Extract token IDs from clobTokenIds (must exist for CLOB markets)
+					token_ids = []
+					clob_token_ids_raw = market_data.get("clobTokenIds", "")
+					if isinstance(clob_token_ids_raw, str):
+						try:
+							token_ids = json.loads(clob_token_ids_raw)
+						except (json.JSONDecodeError, ValueError,
+						        TypeError) as e:
+							token_ids = []
+							logger.debug(
+							    f"Failed to parse clobTokenIds JSON: {e}")
+					elif isinstance(clob_token_ids_raw, list):
+						token_ids = clob_token_ids_raw
 
 					# Must have clobTokenIds with exactly 2 tokens (this is a CLOB market)
 					if not token_ids or len(token_ids) != 2:
@@ -610,7 +613,7 @@ class PolymarketClient:
 								        "resolved", False)
 								    or market_data.get("closed", False),
 								    resolution=None)
-								markets.append(opposite_market)
+							markets.append(opposite_market)
 				except Exception as e:
 					logger.warning(f"Failed to parse market: {e}",
 					               exc_info=True)
