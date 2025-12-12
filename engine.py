@@ -61,81 +61,37 @@ class PaperTradingEngine:
 			self._start_websocket()
 
 		try:
-			# Get ALL active market pairs to trade on all tokens simultaneously
 			self.market_pairs = self.client.find_market_pairs(
-			    only_current=False)
+			    only_current=True)
 
 			if not self.market_pairs:
 				logger.warning(
 				    "No active market pairs found. Waiting for next market to start..."
 				)
 			else:
-				# CRITICAL: Subscribe WebSocket to tokens from loaded market pairs
-				# This ensures we're subscribed to the correct, current tokens
+				# Subscribe WebSocket to all tokens from current pairs
 				if self.client.ws_client:
-					logger.info(
-					    f"Subscribing WebSocket to tokens from {len(self.market_pairs)} market pairs..."
-					)
-					self._resubscribe_websocket_all_pairs(self.market_pairs)
+					self._resubscribe_websocket(self.market_pairs)
 		except Exception as e:
 			logger.error(f"Failed to initialize market pairs: {e}",
 			             exc_info=True)
 			self.market_pairs = []
 
 	def _start_websocket(self):
-		"""Start WebSocket client in a separate thread with auto-reconnect."""
+		"""Start WebSocket client in a separate thread."""
 
 		async def ws_loop():
-			reconnect_delay = 5  # Start with 5 seconds
-			max_reconnect_delay = 60  # Max 60 seconds
-
-			while self.running:
-				try:
-					# Connect
-					connected = await self.client.ws_client.connect()
-					if not connected:
-						logger.warning(
-						    f"WebSocket connection failed, retrying in {reconnect_delay}s..."
-						)
-						await asyncio.sleep(reconnect_delay)
-						reconnect_delay = min(reconnect_delay * 2,
-						                      max_reconnect_delay)
-						continue
-
-					# Reset reconnect delay on successful connection
-					reconnect_delay = 5
-
-					# Don't subscribe initially - wait for market pairs to be loaded
-					# Initial subscription will happen in initialize() after market_pairs are loaded
-					logger.info(
-					    "WebSocket connected, waiting for market pairs to subscribe..."
-					)
-					success = True  # Connection successful, subscription happens later
-					if success:
-						logger.info(
-						    "✅ WebSocket subscribed to markets successfully")
-						await self.client.ws_client.listen()
-					else:
-						logger.warning(
-						    "Failed to subscribe to WebSocket markets")
-						await asyncio.sleep(reconnect_delay)
-						reconnect_delay = min(reconnect_delay * 2,
-						                      max_reconnect_delay)
-						continue
-
-				except Exception as e:
-					error_type = type(e).__name__
-					if websockets and isinstance(
-					    e, websockets.exceptions.ConnectionClosed):
-						logger.warning(
-						    f"WebSocket connection closed, reconnecting in {reconnect_delay}s..."
-						)
-					else:
-						logger.error(f"WebSocket error ({error_type}): {e}",
-						             exc_info=True)
-					await asyncio.sleep(reconnect_delay)
-					reconnect_delay = min(reconnect_delay * 2,
-					                      max_reconnect_delay)
+			try:
+				await self.client.ws_client.connect()
+				# Use the new subscribe_to_markets method
+				success = await self.client.ws_client.subscribe_to_markets()
+				if success:
+					logger.info("WebSocket subscribed to markets successfully")
+					await self.client.ws_client.listen()
+				else:
+					logger.warning("Failed to subscribe to WebSocket markets")
+			except Exception as e:
+				logger.error(f"WebSocket error: {e}", exc_info=True)
 
 		def run_ws():
 			loop = asyncio.new_event_loop()
@@ -144,9 +100,7 @@ class PaperTradingEngine:
 
 		self.ws_thread = threading.Thread(target=run_ws, daemon=True)
 		self.ws_thread.start()
-		logger.info(
-		    "WebSocket client started for real-time market data (with auto-reconnect)"
-		)
+		logger.info("WebSocket client started for real-time market data")
 
 	def run(self):
 		"""Run the main trading loop."""
@@ -165,96 +119,93 @@ class PaperTradingEngine:
 			time.sleep(self.config.polling_interval_seconds)
 
 	def _iteration(self):
-		"""
-        Execute one iteration of the trading loop - SIMPLIFIED.
-
-        Only refreshes markets when:
-        - No markets loaded (startup)
-        - Current market expired
-        - Current market about to expire (within 5 seconds)
-
-        This avoids rate limiting by not polling the API constantly.
-        WebSocket provides real-time price data, so we only need to refresh
-        market metadata when markets change (every 15 minutes or hourly).
-        """
+		"""Execute one iteration of the trading loop."""
+		# 1. Determinar si necesitamos refrescar la lista de mercados
+		# OPTIMIZACIÓN: Solo consultamos Gamma API cuando es estrictamente necesario
+		# (al inicio o cuando el mercado actual termina), NO constantemente.
+		should_refresh = False
 		now = datetime.now(timezone.utc)
 
-		# Check if we need to refresh markets
-		should_refresh = False
-
 		if not self.market_pairs:
-			# No markets loaded - refresh immediately
+			# Caso A: No tenemos mercados cargados (inicio o error previo)
 			should_refresh = True
 		else:
-			current_pair = self.market_pairs[0]
-
-			# Check if current market expired or is about to expire
-			if hasattr(current_pair, '_end_date') and current_pair._end_date:
-				if current_pair._end_date < now:
-					logger.info("⏰ Mercado expirado, buscando siguiente...")
-					should_refresh = True
-				else:
-					# Check if market is about to expire (within 5 seconds)
-					# This ensures we refresh right before the market ends to catch the next one
-					time_left = (current_pair._end_date - now).total_seconds()
-					if time_left <= 5:
+			# Check if any of the current pairs has expired
+			any_expired = False
+			for pair in self.market_pairs:
+				if hasattr(pair, '_end_date') and pair._end_date:
+					time_left = (pair._end_date - now).total_seconds()
+					if time_left <= 0:
+						any_expired = True
+						break
+					elif time_left <= 30 and self._iteration_count % 20 == 0:
+						# Caso B: Faltan 30s. Refrescamos preventivamente para tener el ID del
+						# siguiente mercado listo en cuanto este cierre. (Baja frecuencia)
 						logger.info(
-						    f"⏰ Mercado expira en {time_left:.0f}s, refrescando..."
-						)
+						    "⚠️ Preparando transición al siguiente mercado...")
 						should_refresh = True
+						break
 
-		# Refresh markets if needed
+			if any_expired:
+				# Al menos un mercado terminado - buscar siguientes
+				logger.info(
+				    "⏰ Al menos un mercado ha terminado. Buscando los siguientes..."
+				)
+				should_refresh = True
+
+		# 2. Ejecutar el refresco SOLO si es necesario
+		# ELIMINADO: "or self._iteration_count % 12 == 0" <- Esto causaba spam a la API
 		if should_refresh:
 			try:
-				new_pairs = self.client.find_market_pairs(only_current=False)
+				new_pairs = self.client.find_market_pairs(only_current=True)
+
 				if new_pairs:
-					# Check if token IDs changed (simple comparison)
-					old_tokens = set()
-					for p in self.market_pairs:
-						if p.up_market.token_id:
-							old_tokens.add(p.up_market.token_id)
-						if p.down_market.token_id:
-							old_tokens.add(p.down_market.token_id)
-						# Also check market_id as fallback
-						if not p.up_market.token_id and p.up_market.market_id:
-							old_tokens.add(p.up_market.market_id)
-						if not p.down_market.token_id and p.down_market.market_id:
-							old_tokens.add(p.down_market.market_id)
+					# Detectar si hemos cambiado de mercado (comparar todos los pares)
+					old_pair_ids = {p.pair_id
+					                for p in self.market_pairs
+					                } if self.market_pairs else set()
+					new_pair_ids = {p.pair_id for p in new_pairs}
 
-					new_tokens = set()
-					for p in new_pairs:
-						if p.up_market.token_id:
-							new_tokens.add(p.up_market.token_id)
-						if p.down_market.token_id:
-							new_tokens.add(p.down_market.token_id)
-						# Also check market_id as fallback
-						if not p.up_market.token_id and p.up_market.market_id:
-							new_tokens.add(p.up_market.market_id)
-						if not p.down_market.token_id and p.down_market.market_id:
-							new_tokens.add(p.down_market.market_id)
+					if old_pair_ids != new_pair_ids:
+						tokens_changed = []
+						for p in new_pairs:
+							q = p.up_market.question.lower()
+							market_id = (p.up_market.market_id or "").lower()
+							condition_id = (p.up_market.condition_id
+							                or "").lower()
+							pair_id = (p.pair_id or "").lower()
 
-					# If tokens changed OR if we had no markets before, resubscribe WebSocket
-					if old_tokens != new_tokens or not self.market_pairs:
-						if old_tokens != new_tokens:
-							logger.info(
-							    f"🔄 Cambio de mercado detectado: {len(new_pairs)} pairs activos"
-							)
-							logger.info(
-							    f"   Tokens antiguos: {len(old_tokens)}, Tokens nuevos: {len(new_tokens)}"
-							)
-						else:
-							logger.info(
-							    f"🔌 Suscribiendo WebSocket a {len(new_pairs)} pairs (primera vez)"
-							)
+							for token in getattr(self.config,
+							                     'supported_tokens',
+							                     ['BTC', 'ETH', 'SOL', 'XRP']):
+								token_lower = token.lower()
+								if (token_lower in q
+								    or token_lower in market_id
+								    or token_lower in condition_id
+								    or token_lower in pair_id):
+									tokens_changed.append(token)
+									break
+								# Special case for BTC: also check "bitcoin"
+								if token == "BTC" and (
+								    "bitcoin" in q or "bitcoin" in market_id
+								    or "bitcoin" in condition_id
+								    or "bitcoin" in pair_id):
+									tokens_changed.append(token)
+									break
+						logger.info(
+						    f"🔄 Cambio de mercado detectado: {len(new_pairs)} pares activos para tokens {', '.join(set(tokens_changed))}"
+						)
 
+						# IMPORTANTE: Suscribir WebSocket a los nuevos tokens de TODOS los pares
 						if self.client.ws_client:
-							self._resubscribe_websocket_all_pairs(new_pairs)
+							self._resubscribe_websocket(new_pairs)
 
 					self.market_pairs = new_pairs
+
 			except Exception as e:
 				logger.error(f"Error refrescando mercados: {e}", exc_info=True)
 
-		# Trading logic (uses WebSocket cache only)
+		# 3. Lógica de Trading (usa WebSocket cache, no HTTP)
 		self._update_positions()
 		self._check_entry_opportunities()
 		self._check_resolved_markets()
@@ -262,58 +213,18 @@ class PaperTradingEngine:
 
 		self._iteration_count += 1
 
-	def _resubscribe_websocket_all_pairs(self, pairs: list[MarketPair]):
+	def _resubscribe_websocket(self, new_pairs: list[MarketPair]):
 		"""
-        SIMPLIFIED: Just collect token IDs from pairs and resubscribe WebSocket.
+        Resubscribe WebSocket to new market tokens when markets change.
 
-        CRITICAL: Includes "grace period" for recently expired markets to avoid
-        race condition where API hasn't indexed new market yet. This keeps the
-        WebSocket subscribed during market transitions.
+        Cada 15 minutos los Token IDs cambian. Sin esto, el WebSocket
+        seguiría enviando precios del mercado viejo.
+        Ahora suscribe a TODOS los tokens de TODOS los pares activos.
         """
 		try:
-			now = datetime.now(timezone.utc)
-			# Grace period: keep listening to expired markets for 10 minutes
-			# This prevents empty subscriptions during market transitions when
-			# API hasn't indexed the new market yet
-			grace_period_seconds = 600  # 10 minutes
-			grace_cutoff = now - timedelta(seconds=grace_period_seconds)
-
-			# Filter: include active pairs + recently expired pairs (grace period)
-			active_pairs = []
-			grace_period_pairs = []
-			for pair in pairs:
-				if pair.up_market.is_resolved or pair.down_market.is_resolved:
-					continue
-				if hasattr(pair, '_end_date') and pair._end_date:
-					# Include if market hasn't expired OR expired within grace period
-					if pair._end_date < grace_cutoff:
-						# Market expired too long ago, skip it
-						continue
-					elif pair._end_date < now:
-						# Market expired but within grace period - include for WebSocket but mark it
-						grace_period_pairs.append(pair)
-						active_pairs.append(pair)
-						continue
-				active_pairs.append(pair)
-
-			# Log if we're including grace period markets
-			if grace_period_pairs:
-				logger.info(
-				    f"⏳ Incluyendo {len(grace_period_pairs)} mercados en periodo de gracia "
-				    f"(expiraron hace <{grace_period_seconds//60}min) para mantener suscripción durante transición"
-				)
-
-			# Sort by end_date (soonest first)
-			active_pairs.sort(
-			    key=lambda p: p._end_date if hasattr(p, '_end_date') and p.
-			    _end_date else datetime.max.replace(tzinfo=timezone.utc))
-
-			# Limit to 20 pairs (40 tokens max)
-			current_pairs = active_pairs[:20]
-
-			# Collect token IDs - SIMPLE!
+			# Collect all token IDs from all pairs
 			all_tokens = []
-			for pair in current_pairs:
+			for pair in new_pairs:
 				up_token = pair.up_market.token_id or pair.up_market.market_id
 				down_token = pair.down_market.token_id or pair.down_market.market_id
 				if up_token:
@@ -321,69 +232,33 @@ class PaperTradingEngine:
 				if down_token:
 					all_tokens.append(down_token)
 
+			if not all_tokens:
+				return
+
 			# Remove duplicates
 			all_tokens = list(set(all_tokens))
 
-			if not all_tokens:
-				logger.warning(
-				    f"⚠️ No tokens found in {len(current_pairs)} pairs!")
-				return
-
+			tokens_preview = ", ".join(
+			    [t[:20] + "..." for t in all_tokens[:4]])
 			logger.info(
-			    f"🔌 Resuscribiendo WebSocket a {len(all_tokens)} tokens de {len(current_pairs)} markets"
+			    f"🔌 Resuscribiendo WebSocket a {len(all_tokens)} tokens: {tokens_preview}..."
 			)
 
-			# Resubscribe - wait for WebSocket to be connected
-			if self.client.ws_client:
+			# Run subscription in the WebSocket's event loop
+			if self.client.ws_client.websocket:
 				loop = asyncio.new_event_loop()
 
 				async def resubscribe():
-					try:
-						# Wait for WebSocket to be connected (max 10 seconds)
-						max_wait = 10
-						waited = 0
-						while waited < max_wait:
-							if (self.client.ws_client.websocket and hasattr(
-							    self.client.ws_client.websocket, 'state')
-							    and self.client.ws_client.websocket.state.name
-							    == "OPEN"):
-								break
-							await asyncio.sleep(0.5)
-							waited += 0.5
+					await self.client.ws_client.subscribe_to_markets(all_tokens
+					                                                 )
 
-						if waited >= max_wait:
-							logger.warning(
-							    "⚠️ WebSocket not connected after waiting, attempting to connect..."
-							)
-							# Try to connect if not connected
-							connected = await self.client.ws_client.connect()
-							if not connected:
-								logger.warning(
-								    "⚠️ Failed to connect WebSocket")
-								return
-
-						# Now subscribe
-						success = await self.client.ws_client.subscribe_to_markets(
-						    all_tokens)
-						if success:
-							logger.info(
-							    f"✅ WebSocket resubscribed to {len(all_tokens)} tokens"
-							)
-						else:
-							logger.warning(
-							    f"⚠️ WebSocket resubscription failed")
-					except Exception as e:
-						logger.error(f"Error in resubscribe: {e}",
-						             exc_info=True)
-
+				# Run in separate thread to avoid blocking
 				def run_async():
 					asyncio.set_event_loop(loop)
 					loop.run_until_complete(resubscribe())
 
 				thread = threading.Thread(target=run_async, daemon=True)
 				thread.start()
-			else:
-				logger.warning("⚠️ WebSocket client not initialized")
 
 		except Exception as e:
 			logger.error(f"Error resuscribiendo WebSocket: {e}")
@@ -409,62 +284,36 @@ class PaperTradingEngine:
 
 	def _get_instant_quotes(self, pair: MarketPair) -> Optional[tuple]:
 		"""
-        SIMPLIFIED: Get quotes ONLY from WebSocket cache (no HTTP fallback).
-        WebSocket provides real-time data - if it's not available, wait for it.
+        Get quotes from WebSocket cache first (instant), fallback to HTTP.
+        Returns (up_quote, down_quote) or None.
         """
-		if not self.client.ws_client or not self.client.ws_client.is_connected(
-		):
-			return None
+		# Try WebSocket cache first (INSTANT - no latency)
+		if self.client.ws_client:
+			up_token = pair.up_market.token_id or pair.up_market.market_id
+			down_token = pair.down_market.token_id or pair.down_market.market_id
 
-		up_token = pair.up_market.token_id or pair.up_market.market_id
-		down_token = pair.down_market.token_id or pair.down_market.market_id
+			up_data = self.client.ws_client.get_instant_quote(up_token)
+			down_data = self.client.ws_client.get_instant_quote(down_token)
 
-		# Get fresh data from WebSocket cache (relax freshness requirement slightly)
-		# Try with fresh first, then without freshness requirement as fallback
-		up_data = self.client.ws_client.get_instant_quote(up_token,
-		                                                  require_fresh=True)
-		down_data = self.client.ws_client.get_instant_quote(down_token,
-		                                                    require_fresh=True)
+			if up_data and down_data:
+				# Use best ASK for buying (what we'd pay)
+				up_bid, up_ask = up_data
+				down_bid, down_ask = down_data
 
-		# If no fresh data, try without freshness requirement (data might be slightly old but valid)
-		if not up_data:
-			up_data = self.client.ws_client.get_instant_quote(
-			    up_token, require_fresh=False)
-		if not down_data:
-			down_data = self.client.ws_client.get_instant_quote(
-			    down_token, require_fresh=False)
+				up_quote = Quote(
+				    market_id=pair.up_market.market_id,
+				    side=MarketSide.UP,
+				    price=up_ask,  # Use ASK for buying
+				    timestamp=datetime.now())
+				down_quote = Quote(
+				    market_id=pair.down_market.market_id,
+				    side=MarketSide.DOWN,
+				    price=down_ask,  # Use ASK for buying
+				    timestamp=datetime.now())
+				return (up_quote, down_quote)
 
-		# Debug: Log when we can't get quotes (only occasionally to avoid spam)
-		if (not up_data or not down_data) and self._iteration_count % 30 == 0:
-			cache_size = len(self.client.ws_client.markets_cache
-			                 ) if self.client.ws_client else 0
-			up_in_cache = up_token in (self.client.ws_client.markets_cache
-			                           if self.client.ws_client else {})
-			down_in_cache = down_token in (self.client.ws_client.markets_cache
-			                               if self.client.ws_client else {})
-			# Show sample of cached asset IDs for debugging
-			sample_ids = list(self.client.ws_client.markets_cache.keys())[:3] if self.client.ws_client and self.client.ws_client.markets_cache else []
-
-			logger.debug(
-			    f"⚠️ No quotes: UP token={up_token[:20]}... in_cache={up_in_cache}, "
-			    f"DOWN token={down_token[:20]}... in_cache={down_in_cache}, "
-			    f"cache_size={cache_size}, sample_ids={sample_ids}")
-
-		if up_data and down_data:
-			up_bid, up_ask = up_data
-			down_bid, down_ask = down_data
-
-			up_quote = Quote(market_id=pair.up_market.market_id,
-			                 side=MarketSide.UP,
-			                 price=up_ask,
-			                 timestamp=datetime.now())
-			down_quote = Quote(market_id=pair.down_market.market_id,
-			                   side=MarketSide.DOWN,
-			                   price=down_ask,
-			                   timestamp=datetime.now())
-			return (up_quote, down_quote)
-
-		return None
+		# Fallback to HTTP (slower but more reliable)
+		return self.client.get_pair_quotes(pair)
 
 	def _check_entry_opportunities(self):
 		"""Check for entry opportunities using Leg-In strategy."""
@@ -484,88 +333,15 @@ class PaperTradingEngine:
 
 		best_quote = None
 
-		# Filter to only ACTIVE markets (not expired, not resolved)
-		# NOTE: We keep expired markets in WebSocket subscription (grace period),
-		# but we don't trade on them - only listen for resolution
-		now = datetime.now(timezone.utc)
-
-		active_pairs = []
 		for pair in self.market_pairs:
-			# Skip if already resolved
-			if pair.up_market.is_resolved or pair.down_market.is_resolved:
-				continue
-
-			# Skip if end_date is in the past (don't trade on expired markets)
-			# But keep them in WebSocket subscription for resolution data
-			if hasattr(pair, '_end_date') and pair._end_date:
-				if pair._end_date < now:
-					continue  # Don't trade, but WebSocket still subscribed (grace period)
-
-			active_pairs.append(pair)
-
-		# Sort by end_date (soonest first) to prioritize urgent markets
-		active_pairs.sort(
-		    key=lambda p: p._end_date if hasattr(p, '_end_date') and p.
-		    _end_date else datetime.max.replace(tzinfo=timezone.utc))
-
-		# Check ALL active pairs to find the best opportunity
-		# Don't limit - we want to find the best price across all markets
-		pairs_to_check = active_pairs if active_pairs else self.market_pairs[:4]
-
-		# Log progress every 10 iterations
-		if self._iteration_count % 10 == 0:
-			ws_status = "disconnected"
-			if self.client.ws_client:
-				ws_status = "connected" if self.client.ws_client.is_connected(
-				) else "disconnected"
-				cache_size = len(
-				    self.client.ws_client.markets_cache
-				) if self.client.ws_client.markets_cache else 0
-				ws_status = f"{ws_status} ({cache_size} tokens)"
-			#logger.info(
-			#    f"🔄 Iteration {self._iteration_count}: Checking {len(pairs_to_check)}/{len(self.market_pairs)} pairs | WS: {ws_status} | Positions: {len(self.positions)}"
-			#)
-
-		quotes_found = 0
-		quotes_missing = 0
-
-		# FIRST PASS: Get quotes for ALL pairs and sort by best opportunity (combined_price)
-		# This ensures we process the best opportunities first (e.g., 0.230 vs 0.510)
-		all_pair_quotes = []  # Store (pair, pair_quote) for sorting
-
-		for pair in pairs_to_check:
 			# Get quotes - WebSocket first, then HTTP fallback
 			quotes = self._get_instant_quotes(pair)
 			if not quotes:
-				quotes_missing += 1
 				continue
 
-			quotes_found += 1
 			up_quote, down_quote = quotes
 			pair_quote = PairQuote.create(pair, up_quote, down_quote)
-			all_pair_quotes.append((pair, pair_quote))
 
-			# Track best quote for logging
-			if best_quote is None or pair_quote.combined_price < best_quote.combined_price:
-				best_quote = pair_quote
-
-		# Sort by combined_price (best opportunities first - lowest combined = best)
-		all_pair_quotes.sort(key=lambda x: x[1].combined_price)
-
-		# Log best opportunities found (every 10 iterations)
-		if all_pair_quotes and self._iteration_count % 10 == 0:
-			best_5 = all_pair_quotes[:5]
-			logger.info(
-			    f"🏆 Top 5 opportunities (de {len(all_pair_quotes)} con quotes):"
-			)
-			for i, (p, pq) in enumerate(best_5, 1):
-				logger.info(
-				    f"  {i}. Combined=${pq.combined_price:.3f} | "
-				    f"UP=${pq.up_quote.price:.3f} DOWN=${pq.down_quote.price:.3f} | "
-				    f"Pair={p.pair_id[:8]}...")
-
-		# SECOND PASS: Process pairs starting with the BEST opportunities
-		for pair, pair_quote in all_pair_quotes:
 			# Check SCRATCH logic for pending positions FIRST (emergency exit)
 			self._process_scratch_logic(pair, pair_quote)
 
@@ -581,13 +357,16 @@ class PaperTradingEngine:
 					if self.strategy.should_bail_out(position, pair_quote):
 						logger.warning(
 						    f"🚨 BAIL OUT - Position {position.position_id[:8]}... | "
-						    f"UP: ${pair_quote.up_quote.price:.3f} DOWN: ${pair_quote.down_quote.price:.3f}"
+						    f"UP: ${up_quote.price:.3f} DOWN: ${down_quote.price:.3f}"
 						)
 						# Use smart scratch execution (recovers real market value)
 						self._execute_scratch(position,
 						                      pair_quote,
 						                      reason="BAIL_OUT_CRASH")
 						continue
+
+			if best_quote is None or pair_quote.combined_price < best_quote.combined_price:
+				best_quote = pair_quote
 
 			# Step 1: Check if any pending position can be completed
 			for position in pending_positions:
@@ -606,11 +385,8 @@ class PaperTradingEngine:
 							available_capital = self.config.max_capital - total_capital_deployed
 
 			# Step 2: Check if we should buy first leg
-			# Only skip if we have a PENDING position in this pair (needs capital to complete)
-			# Allow new entries even if we have OPEN positions (already completed, don't need capital)
-			if any(p.pair_id == pair.pair_id and p.status in
-			       [PositionStatus.PENDING_UP, PositionStatus.PENDING_DOWN]
-			       for p in self.positions.values()):
+			# Skip if we already have any position in this pair
+			if any(p.pair_id == pair.pair_id for p in all_active):
 				continue
 
 			# Calculate time remaining for this market
@@ -638,11 +414,10 @@ class PaperTradingEngine:
 					total_capital_deployed += position.total_cost_usd
 					available_capital = self.config.max_capital - total_capital_deployed
 
-		# Log status every 6 iterations (~1.2 seconds with 0.2s polling)
+		# Log status every 6 iterations (~30 seconds)
 		self._iteration_count += 1
 		if self._iteration_count % 6 == 0 and self.market_pairs:
-			# Show info about first pair (or any active pair)
-			current_pair = self.market_pairs[0] if self.market_pairs else None
+			current_pair = self.market_pairs[0]
 			time_info = ""
 			if hasattr(current_pair, '_end_date') and current_pair._end_date:
 				now = datetime.now(timezone.utc)
@@ -661,20 +436,10 @@ class PaperTradingEngine:
 			    if p.status == PositionStatus.OPEN
 			])
 
-			# Check WebSocket status with connection verification
+			# Check WebSocket status
 			ws_status = "🔴 HTTP"
-			cache_size = 0
-			fresh_count = 0
-			if self.client.ws_client:
-				if self.client.ws_client.is_connected():
-					cache_size = len(self.client.ws_client.markets_cache)
-					fresh_count = sum(
-					    1 for asset_id in
-					    self.client.ws_client.markets_cache.keys()
-					    if self.client.ws_client.is_data_fresh(asset_id))
-					ws_status = f"🟢 WS({cache_size}, {fresh_count}fresh)"
-				else:
-					ws_status = "🟡 WS(disconnected)"
+			if self.client.ws_client and self.client.ws_client.markets_cache:
+				ws_status = f"🟢 WS({len(self.client.ws_client.markets_cache)})"
 
 			if best_quote:
 				up_p = best_quote.up_quote.price
@@ -687,12 +452,6 @@ class PaperTradingEngine:
 				logger.info(
 				    f"{ws_status} | UP: ${up_p:.3f} DOWN: ${down_p:.3f} | "
 				    f"{spread_info} | {n_pending}P {n_open}O | {time_info}")
-			else:
-				# Show diagnostic info when no quotes available
-				logger.warning(
-				    f"{ws_status} | ⚠️ No quotes available | "
-				    f"Pairs checked: {len(pairs_to_check)}, Found: {quotes_found}, Missing: {quotes_missing} | "
-				    f"{n_pending}P {n_open}O | {time_info}")
 
 	def _check_resolved_markets(self):
 		"""
@@ -738,7 +497,7 @@ class PaperTradingEngine:
 				shares = position.up_size_usd / position.entry_up_price if position.entry_up_price > 0 else 0
 				payout = shares * 1.0  # $1.00 per share guaranteed
 
-				# PnL = Payout - Total Cost (no fees on Polymarket)
+				# PnL = Payout - Total Cost (fees already in cost)
 				realized_pnl = payout - position.total_cost_usd
 
 				position.realized_pnl_usd = realized_pnl
@@ -905,9 +664,10 @@ class PaperTradingEngine:
 		shares = position_size / entry_price if entry_price > 0 else 0
 
 		# Calculate recovery amount (what we get back)
-		# Recovery = Shares * Exit Price (no fees on Polymarket)
+		# Recovery = (Shares * Exit Price) - Fees
 		gross_recovery = shares * exit_price
-		net_recovery = gross_recovery  # No fees to deduct
+		fee_amount = gross_recovery * (self.config.trading_fee_percent / 100.0)
+		net_recovery = gross_recovery - fee_amount
 
 		# Calculate PnL (negative = loss)
 		pnl = net_recovery - position.total_cost_usd

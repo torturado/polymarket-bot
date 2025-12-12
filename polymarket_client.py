@@ -1,6 +1,7 @@
 """
 Polymarket API client using the official py-clob-client SDK.
 """
+import json
 import logging
 import time
 import requests
@@ -779,52 +780,89 @@ class PolymarketClient:
 				    f"  #{i+1}: {p.up_market.question[:50]}... | End: {ed_str}"
 				)
 
-		# If only_current, filter to just the market ending soonest
+		# If only_current, filter to one pair per supported token (the current/soonest ending for each)
 		if only_current and pairs:
-			current_pair = pairs[0]
-			end_time = current_pair._end_date if hasattr(
-			    current_pair, '_end_date') else None
+			supported_tokens = getattr(self.config, 'supported_tokens',
+			                           ['BTC', 'ETH', 'SOL', 'XRP'])
 
-			if end_time:
-				time_remaining = end_time - now
-				minutes_left = int(time_remaining.total_seconds() // 60)
-				seconds_left = int(time_remaining.total_seconds() % 60)
+			# Group pairs by token
+			pairs_by_token = {}
 
-				# If market has ended, try next one
-				if time_remaining.total_seconds() < 0:
-					logger.info(f"⏰ Market ended, looking for next...")
-					for p in pairs[1:]:
-						p_end = p._end_date if hasattr(p,
-						                               '_end_date') else None
-						if p_end and p_end > now:
-							current_pair = p
-							time_remaining = p_end - now
-							minutes_left = int(
-							    time_remaining.total_seconds() // 60)
-							seconds_left = int(time_remaining.total_seconds() %
-							                   60)
+			for pair in pairs:
+				# Extract token from market question/slug/condition_id
+				market_question = pair.up_market.question.lower()
+				market_slug = (pair.up_market.market_id or "").lower()
+				condition_id = (pair.up_market.condition_id or "").lower()
+				pair_id = (pair.pair_id or "").lower()
+
+				token_found = None
+				for token in supported_tokens:
+					token_lower = token.lower()
+					# Check token abbreviation in question, market_id, condition_id, or pair_id
+					if (token_lower in market_question
+					    or token_lower in market_slug
+					    or token_lower in condition_id
+					    or token_lower in pair_id):
+						token_found = token
+						break
+					# Special case for BTC: also check "bitcoin" in all fields
+					if token == "BTC":
+						if ("bitcoin" in market_question
+						    or "bitcoin" in market_slug
+						    or "bitcoin" in condition_id
+						    or "bitcoin" in pair_id):
+							token_found = token
 							break
 
-				# Extract token from market question/slug for better logging
-				market_question = current_pair.up_market.question
-				token_info = ""
-				for token in getattr(self.config, 'supported_tokens',
-				                     ['BTC', 'ETH', 'SOL', 'XRP']):
-					if token.lower() in market_question.lower() or token.lower(
-					) in (current_pair.up_market.market_id or "").lower():
-						token_info = f"[{token}] "
+				if token_found:
+					if token_found not in pairs_by_token:
+						pairs_by_token[token_found] = []
+					pairs_by_token[token_found].append(pair)
+
+			# For each token, select the pair ending soonest (current market)
+			current_pairs = []
+			tracked_tokens = []
+
+			for token in supported_tokens:
+				if token not in pairs_by_token:
+					continue
+
+				token_pairs = pairs_by_token[token]
+				# Sort by end_date (soonest first)
+				token_pairs.sort(
+				    key=lambda p: p._end_date if hasattr(p, '_end_date') and p.
+				    _end_date else datetime.max.replace(tzinfo=timezone.utc))
+
+				# Find the first pair that hasn't ended yet
+				current_pair = None
+				for p in token_pairs:
+					p_end = p._end_date if hasattr(p, '_end_date') else None
+					if p_end and p_end > now - timedelta(seconds=30):
+						current_pair = p
 						break
 
-				logger.info(
-				    f"🎯 TRACKING {token_info}{current_pair.up_market.question[:50]}... | "
-				    f"Ends in {minutes_left}m {seconds_left}s | "
-				    f"Condition: {current_pair.pair_id[:16]}...")
-			else:
-				logger.info(
-				    f"🎯 TRACKING: {current_pair.up_market.question[:60]}... (no end date)"
-				)
+				if current_pair:
+					current_pairs.append(current_pair)
+					tracked_tokens.append(token)
 
-			return [current_pair]
+					# Log tracking info for this token
+					end_time = current_pair._end_date if hasattr(
+					    current_pair, '_end_date') else None
+					if end_time:
+						time_remaining = end_time - now
+						minutes_left = int(time_remaining.total_seconds() //
+						                   60)
+						seconds_left = int(time_remaining.total_seconds() % 60)
+						logger.info(
+						    f"🎯 TRACKING [{token}] {current_pair.up_market.question[:50]}... | "
+						    f"Ends in {minutes_left}m {seconds_left}s | "
+						    f"Condition: {current_pair.pair_id[:16]}...")
+					else:
+						logger.info(
+						    f"🎯 TRACKING [{token}]: {current_pair.up_market.question[:60]}... (no end date)"
+						)
+
+			return current_pairs
 
 		return pairs
 
