@@ -53,6 +53,22 @@ def _get_json_any(name: str):
         return None
 
 
+def _strip_wrapping_quotes(value: str) -> str:
+    v = value.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in {"'", '"'}:
+        return v[1:-1].strip()
+    return v
+
+
+def _normalize_private_key(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    v = _strip_wrapping_quotes(value)
+    if not v:
+        return None
+    return v
+
+
 def _get_float_list(name: str) -> Optional[List[float]]:
     raw = _get_env(name)
     if raw is None:
@@ -217,7 +233,7 @@ class Config:
         return cls(
             host=_get_env("POLYMARKET_HOST", cls.host),
             chain_id=_get_int("CHAIN_ID", cls.chain_id),
-            private_key=_get_env("PRIVATE_KEY"),
+            private_key=_normalize_private_key(_get_env("PRIVATE_KEY")),
             funder=_get_env("FUNDER"),
             api_key=_get_env("POLYMARKET_API_KEY"),
             api_secret=_get_env("POLYMARKET_API_SECRET"),
@@ -381,6 +397,16 @@ class Config:
             ]
             if missing:
                 raise ValueError(f"Missing required config fields: {missing}")
+
+            if self.private_key:
+                pk = str(self.private_key).strip()
+                if pk.startswith("0x"):
+                    pk = pk[2:]
+                is_hex = all(c in "0123456789abcdefABCDEF" for c in pk)
+                if not is_hex or len(pk) != 64:
+                    raise ValueError(
+                        "Invalid PRIVATE_KEY: expected 32-byte hex string (64 hex chars, optional 0x prefix)"
+                    )
 
         if not (0.0 < float(self.initial_entry_fraction) <= 1.0):
             raise ValueError("INITIAL_ENTRY_FRACTION must be within (0, 1]")

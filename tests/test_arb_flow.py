@@ -44,3 +44,21 @@ def test_arb_flow_paper_trading(tmp_path):
 
     asyncio.run(_run())
 
+
+def test_paper_trading_ignores_invalid_private_key(tmp_path):
+    cfg = Config(
+        paper_trading=True,
+        private_key="not-a-hex-key",
+        paper_trades_log=str(tmp_path / "paper_trades.csv"),
+        arb_enabled=True,
+        arb_max_entry_exit_cost=0.99,
+        arb_budget_usdc=99.0,
+        market_specs=[
+            {
+                "condition_id": "c1",
+                "yes_token_id": "yes1",
+                "no_token_id": "no1",
+            }
+        ],
+    )
+    LegInBot(cfg)

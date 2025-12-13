@@ -24,11 +24,12 @@ from src.config import Config
 from src.execution_engine import ExecutionEngine
 from src.market_monitor import MarketMonitor
 from src.position_manager import LegInPosition, PositionManager, PositionState
+from src.telemetry import Telemetry
 from src.utils.market_utils import MarketSpec
 
 
 class LegInBot:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, telemetry: Telemetry | None = None):
         self.config = config
         self.config.validate()
 
@@ -36,25 +37,35 @@ class LegInBot:
         self.logger = logging.getLogger(self.__class__.__name__)
 
         creds = None
-        if self.config.api_key and self.config.api_secret and self.config.api_passphrase:
+        if (
+            not self.config.paper_trading
+            and self.config.api_key
+            and self.config.api_secret
+            and self.config.api_passphrase
+        ):
             creds = ApiCreds(
                 api_key=self.config.api_key,
                 api_secret=self.config.api_secret,
                 api_passphrase=self.config.api_passphrase,
             )
 
+        key = None if self.config.paper_trading else self.config.private_key
+        funder = None if self.config.paper_trading else self.config.funder
+
         self.client = ClobClient(
             host=self.config.host,
             chain_id=self.config.chain_id,
-            key=self.config.private_key,
+            key=key,
             creds=creds,
-            funder=self.config.funder,
+            funder=funder,
         )
 
         self.market_specs = self._load_market_specs()
         self.monitor = MarketMonitor(self.client, self.market_specs, self.config)
         self.position_manager = PositionManager(self.config)
         self.execution_engine = ExecutionEngine(self.client, self.config)
+
+        self.telemetry = telemetry
 
         self.positions: Dict[str, LegInPosition] = {}
         self._cooldown_until: Dict[str, float] = {}
@@ -227,8 +238,27 @@ class LegInBot:
             float(pnl_usdc),
             self._daily_pnl_usdc,
         )
+        if self.telemetry:
+            self.telemetry.emit(
+                "pnl",
+                condition_id=condition_id,
+                action=action,
+                pnl_usdc=float(pnl_usdc),
+                daily_pnl_usdc=float(self._daily_pnl_usdc),
+            )
 
     def _finish_position(self, condition_id: str) -> None:
+        if self.telemetry and condition_id in self.positions:
+            p = self.positions.get(condition_id)
+            if p is not None:
+                self.telemetry.emit(
+                    "position_closed",
+                    condition_id=condition_id,
+                    state=p.state.value,
+                    side=p.leg_1_side,
+                    entry_price=float(p.leg_1_entry_price),
+                    size=float(p.leg_1_size),
+                )
         self.positions.pop(condition_id, None)
         cooldown_s = float(self.config.reentry_cooldown_s)
         if cooldown_s > 0:
@@ -307,10 +337,27 @@ class LegInBot:
                     )
                 )
                 self._track_vacuum_task(task)
+                if self.telemetry:
+                    self.telemetry.emit(
+                        "vacuum_order",
+                        condition_id=cid,
+                        side=side,
+                        price=float(p),
+                        size=float(size),
+                        usdc=float(self.config.vacuum_usdc_per_order),
+                    )
 
     async def _task_execute_leg_1(self, position: LegInPosition) -> None:
         cid = position.condition_id
         token_id = position.yes_token_id if position.leg_1_side == "YES" else position.no_token_id
+        if self.telemetry:
+            self.telemetry.emit(
+                "leg1_start",
+                condition_id=cid,
+                side=position.leg_1_side,
+                price=float(position.leg_1_entry_price),
+                size=float(position.leg_1_size),
+            )
         ok = await self.execution_engine.execute_leg_1(
             position, price_data_fn=lambda: self.monitor.get_current_price(token_id)
         )
@@ -321,6 +368,14 @@ class LegInBot:
             return
         self._entry_counts[cid] = self._entry_counts.get(cid, 0) + 1
         position.state = PositionState.HOLDING
+        if self.telemetry:
+            self.telemetry.emit(
+                "leg1_filled",
+                condition_id=cid,
+                side=position.leg_1_side,
+                vwap=float(position.leg_1_entry_price),
+                filled_size=float(position.leg_1_size),
+            )
 
     async def _task_arb(self, position: LegInPosition, *, yes_ask: float, no_ask: float, yes_bid: float, no_bid: float) -> None:
         cid = position.condition_id
@@ -348,6 +403,14 @@ class LegInBot:
 
         opp_side = "NO" if position.leg_1_side == "YES" else "YES"
         opp_ask = no_ask if opp_side == "NO" else yes_ask
+        if self.telemetry:
+            self.telemetry.emit(
+                "arb_leg2_start",
+                condition_id=cid,
+                side=opp_side,
+                price=float(opp_ask),
+                size=float(position.leg_1_size),
+            )
         opp_token_id = (
             position.no_token_id if position.leg_1_side == "YES" else position.yes_token_id
         )
@@ -365,10 +428,20 @@ class LegInBot:
             return
 
         position.state = PositionState.MERGING
+        if self.telemetry:
+            self.telemetry.emit("arb_merge", condition_id=cid)
         await self._task_merge(position)
 
     async def _task_close_and_merge(self, position: LegInPosition, *, price: float, size: float) -> None:
         cid = position.condition_id
+        if self.telemetry:
+            self.telemetry.emit(
+                "close_start",
+                condition_id=cid,
+                buy_side="NO" if position.leg_1_side == "YES" else "YES",
+                price=float(price),
+                size=float(size),
+            )
         position.leg_2_pending = True
         try:
             opp_token_id = (
@@ -388,6 +461,8 @@ class LegInBot:
             return
 
         position.state = PositionState.MERGING
+        if self.telemetry:
+            self.telemetry.emit("merge_start", condition_id=cid)
         position.merge_pending = True
         try:
             merged = await self.execution_engine.merge_tokens(position)
@@ -407,6 +482,8 @@ class LegInBot:
 
     async def _task_merge(self, position: LegInPosition) -> None:
         cid = position.condition_id
+        if self.telemetry:
+            self.telemetry.emit("merge_start", condition_id=cid)
         position.merge_pending = True
         try:
             ok = await self.execution_engine.merge_tokens(position)
@@ -426,6 +503,15 @@ class LegInBot:
 
     async def _task_unwind(self, position: LegInPosition, *, price: float, size: float, action: str) -> None:
         cid = position.condition_id
+        if self.telemetry:
+            self.telemetry.emit(
+                "sell_start",
+                condition_id=cid,
+                side=position.leg_1_side,
+                price=float(price),
+                size=float(size),
+                action=action,
+            )
         position.unwind_pending = True
         try:
             ok = await self.execution_engine.execute_unwind(position, price=price, size=size)
@@ -450,6 +536,13 @@ class LegInBot:
                 return
 
             token_id = position.yes_token_id if position.leg_1_side == "YES" else position.no_token_id
+            if self.telemetry:
+                self.telemetry.emit(
+                    "scalein_start",
+                    condition_id=cid,
+                    side=position.leg_1_side,
+                    add_usdc=float(add_usdc),
+                )
 
             def _pd():
                 return self.monitor.get_current_price(token_id)
@@ -508,11 +601,22 @@ class LegInBot:
             position.scalein_count += 1
             position.last_scalein_at = time.time()
             position.state = PositionState.HOLDING
+            if self.telemetry:
+                self.telemetry.emit(
+                    "scalein_filled",
+                    condition_id=cid,
+                    side=position.leg_1_side,
+                    new_avg=float(position.leg_1_entry_price),
+                    new_size=float(position.leg_1_size),
+                    scalein_count=int(position.scalein_count),
+                )
         finally:
             position.scalein_pending = False
 
     async def _handle_update(self, update) -> None:
         cid = update.condition_id
+        if self.telemetry:
+            self.telemetry.ingest_market_update(update)
         self._schedule_vacuum_orders(update)
         position = self.positions.get(cid)
 
@@ -540,6 +644,15 @@ class LegInBot:
                         yes_ask,
                         no_ask,
                     )
+                    if self.telemetry:
+                        self.telemetry.emit(
+                            "arb_signal",
+                            condition_id=cid,
+                            yes_ask=float(yes_ask),
+                            no_ask=float(no_ask),
+                            entry_exit_cost=float(entry_exit_cost),
+                            shares=float(shares),
+                        )
                     self._last_entry_signal_at[cid] = now
                     pos = LegInPosition(
                         condition_id=cid,
@@ -553,6 +666,15 @@ class LegInBot:
                         entry_time=now,
                     )
                     self.positions[cid] = pos
+                    if self.telemetry:
+                        self.telemetry.emit(
+                            "position_opened",
+                            condition_id=cid,
+                            mode="arb",
+                            side=pos.leg_1_side,
+                            entry_price=float(pos.leg_1_entry_price),
+                            size=float(pos.leg_1_size),
+                        )
                     task = asyncio.create_task(
                         self._task_arb(
                             pos,
@@ -577,8 +699,26 @@ class LegInBot:
                     update.prices[opp_side].best_ask,
                     entry_exit_cost,
                 )
+                if self.telemetry:
+                    self.telemetry.emit(
+                        "entry_signal",
+                        condition_id=cid,
+                        side=new_pos.leg_1_side,
+                        ask=float(new_pos.leg_1_entry_price),
+                        opp_ask=float(update.prices[opp_side].best_ask),
+                        entry_exit_cost=float(entry_exit_cost),
+                    )
                 self._last_entry_signal_at[cid] = now
                 self.positions[cid] = new_pos
+                if self.telemetry:
+                    self.telemetry.emit(
+                        "position_opened",
+                        condition_id=cid,
+                        mode="leg_in",
+                        side=new_pos.leg_1_side,
+                        entry_price=float(new_pos.leg_1_entry_price),
+                        size=float(new_pos.leg_1_size),
+                    )
                 task = asyncio.create_task(self._task_execute_leg_1(new_pos))
                 self._set_task(cid, task)
             return
@@ -599,6 +739,14 @@ class LegInBot:
                 state.value,
                 "" if exit_cost is None else f" exit_cost={exit_cost:.4f}",
             )
+            if self.telemetry:
+                self.telemetry.emit(
+                    "state_change",
+                    condition_id=cid,
+                    prev=prev_state.value,
+                    new=state.value,
+                    exit_cost=None if exit_cost is None else float(exit_cost),
+                )
 
         if state == PositionState.CLOSING and not position.leg_2_filled and not position.leg_2_pending:
             opp_side = "NO" if position.leg_1_side == "YES" else "YES"
