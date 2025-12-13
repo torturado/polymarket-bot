@@ -12,9 +12,11 @@ from .utils.market_utils import MarketUpdate, opposite_side
 class PositionState(str, Enum):
     WATCHING = "watching"
     ENTERING_LEG_1 = "entering_leg_1"
+    SCALING_IN = "scaling_in"
     HOLDING = "holding"
     CLOSING = "closing"
     MERGING = "merging"
+    TAKE_PROFIT = "take_profit"
     UNWINDING = "unwinding"
 
 
@@ -33,6 +35,12 @@ class LegInPosition:
     leg_2_size: Optional[float] = None
     leg_2_filled: bool = False
     leg_2_pending: bool = False
+    merge_pending: bool = False
+    unwind_pending: bool = False
+    scalein_pending: bool = False
+    scalein_count: int = 0
+    scalein_next_usdc: Optional[float] = None
+    last_scalein_at: float = 0.0
 
 
 class PositionManager:
@@ -109,7 +117,9 @@ class PositionManager:
                 return None
 
         # Interpret MAX_POSITION_SIZE as USDC budget per leg (not shares).
-        size = self.config.max_position_size / entry_price if entry_price > 0 else 0.0
+        # INITIAL_ENTRY_FRACTION leaves headroom for optional scale-ins.
+        budget = float(self.config.max_position_size) * float(self.config.initial_entry_fraction)
+        size = budget / entry_price if entry_price > 0 else 0.0
 
         return LegInPosition(
             condition_id=market_data.condition_id,
@@ -136,7 +146,29 @@ class PositionManager:
                 position.state = PositionState.HOLDING
             return position.state
 
+        if position.state == PositionState.SCALING_IN:
+            return position.state
+
         if position.state == PositionState.HOLDING:
+            if self.config.churn_enabled:
+                my_bid = prices[position.leg_1_side].best_bid
+                if (my_bid - position.leg_1_entry_price) >= float(self.config.churn_take_profit_abs):
+                    position.state = PositionState.TAKE_PROFIT
+                    return position.state
+
+            if self.config.scalein_enabled and position.scalein_count < int(self.config.scalein_max_adds):
+                now = float(market_data.received_at) if market_data.received_at else time.time()
+                if (now - float(position.last_scalein_at)) >= float(self.config.scalein_min_interval_s):
+                    my_ask = prices[position.leg_1_side].best_ask
+                    if (position.leg_1_entry_price - my_ask) >= float(self.config.scalein_trigger_drop_abs):
+                        deployed = float(position.leg_1_entry_price) * float(position.leg_1_size)
+                        headroom = float(self.config.max_position_size) - deployed
+                        add_usdc = min(float(self.config.scalein_add_usdc), headroom)
+                        if add_usdc > 0:
+                            position.scalein_next_usdc = float(add_usdc)
+                            position.state = PositionState.SCALING_IN
+                            return position.state
+
             exit_cost = self.calculate_exit_cost(position, prices)
             if exit_cost <= self.config.target_profit_threshold:
                 position.state = PositionState.CLOSING
@@ -147,6 +179,9 @@ class PositionManager:
         if position.state == PositionState.CLOSING:
             if position.leg_2_filled:
                 position.state = PositionState.MERGING
+            return position.state
+
+        if position.state == PositionState.TAKE_PROFIT:
             return position.state
 
         if position.state in (PositionState.MERGING, PositionState.UNWINDING):

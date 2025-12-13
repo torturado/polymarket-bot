@@ -18,6 +18,8 @@ class PriceData:
     best_bid: float
     best_ask: float
     timestamp: float
+    best_bid_size: float = 0.0
+    best_ask_size: float = 0.0
 
     @property
     def mid(self) -> float:
@@ -43,13 +45,27 @@ def best_prices_from_orderbook(orderbook) -> Optional[PriceData]:
         return None
 
     try:
-        best_bid = float(bids[0].price)
-        best_ask = float(asks[0].price)
+        bid_levels = [(float(b.price), float(b.size)) for b in bids]
+        ask_levels = [(float(a.price), float(a.size)) for a in asks]
     except Exception:
         return None
 
+    if not bid_levels or not ask_levels:
+        return None
+
+    best_bid = max(p for p, _ in bid_levels)
+    best_ask = min(p for p, _ in ask_levels)
+    best_bid_size = sum(sz for p, sz in bid_levels if p == best_bid)
+    best_ask_size = sum(sz for p, sz in ask_levels if p == best_ask)
+
     ts = time.time()
-    return PriceData(best_bid=best_bid, best_ask=best_ask, timestamp=ts)
+    return PriceData(
+        best_bid=best_bid,
+        best_ask=best_ask,
+        timestamp=ts,
+        best_bid_size=best_bid_size,
+        best_ask_size=best_ask_size,
+    )
 
 
 def compute_volatility(prices: List[float]) -> float:

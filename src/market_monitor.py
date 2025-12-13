@@ -255,8 +255,19 @@ class MarketMonitor:
                                         continue
                                     if best_bid <= 0 or best_ask <= 0:
                                         continue
+                                    prev = self._price_data.get(asset_id)
+                                    prev_bid_size = (
+                                        float(getattr(prev, "best_bid_size", 0.0)) if prev else 0.0
+                                    )
+                                    prev_ask_size = (
+                                        float(getattr(prev, "best_ask_size", 0.0)) if prev else 0.0
+                                    )
                                     pd = PriceData(
-                                        best_bid=best_bid, best_ask=best_ask, timestamp=now
+                                        best_bid=best_bid,
+                                        best_ask=best_ask,
+                                        timestamp=now,
+                                        best_bid_size=prev_bid_size,
+                                        best_ask_size=prev_ask_size,
                                     )
                                     self._price_data[asset_id] = pd
                                     spec = token_to_condition[asset_id]
@@ -297,8 +308,19 @@ class MarketMonitor:
                                 continue
                             if best_bid <= 0 or best_ask <= 0:
                                 continue
+                            prev = self._price_data.get(asset_id)
+                            prev_bid_size = (
+                                float(getattr(prev, "best_bid_size", 0.0)) if prev else 0.0
+                            )
+                            prev_ask_size = (
+                                float(getattr(prev, "best_ask_size", 0.0)) if prev else 0.0
+                            )
                             pd = PriceData(
-                                best_bid=best_bid, best_ask=best_ask, timestamp=time.time()
+                                best_bid=best_bid,
+                                best_ask=best_ask,
+                                timestamp=time.time(),
+                                best_bid_size=prev_bid_size,
+                                best_ask_size=prev_ask_size,
                             )
                             self._price_data[asset_id] = pd
                             spec = token_to_condition[asset_id]
@@ -373,13 +395,27 @@ class MarketMonitor:
         try:
             best_bid = max(float(b["price"]) for b in bids) if bids else 0.0
             best_ask = min(float(a["price"]) for a in asks) if asks else 0.0
+            best_bid_size = (
+                sum(float(b["size"]) for b in bids if float(b["price"]) == best_bid)
+                if bids and best_bid > 0
+                else 0.0
+            )
+            best_ask_size = (
+                sum(float(a["size"]) for a in asks if float(a["price"]) == best_ask)
+                if asks and best_ask > 0
+                else 0.0
+            )
         except Exception:
             return
         if best_bid <= 0 or best_ask <= 0:
             return
         now = time.time()
         self._price_data[asset_id] = PriceData(
-            best_bid=best_bid, best_ask=best_ask, timestamp=now
+            best_bid=best_bid,
+            best_ask=best_ask,
+            timestamp=now,
+            best_bid_size=best_bid_size,
+            best_ask_size=best_ask_size,
         )
         if depth_levels > 0:
             self._ask_depth_usdc[asset_id] = self._compute_ask_depth_usdc(

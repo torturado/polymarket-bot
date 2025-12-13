@@ -63,6 +63,9 @@ class LegInBot:
         self._daily_pnl_usdc: float = 0.0
         self._daily_pnl_day_utc = _dt.datetime.now(_dt.timezone.utc).date()
         self._daily_loss_tripped: bool = False
+        self._tasks_by_condition: Dict[str, asyncio.Task] = {}
+        self._vacuum_placed: set[tuple[str, str, float]] = set()
+        self._vacuum_tasks: set[asyncio.Task] = set()
 
         # If using MARKET_SPECS_FILE, keep the file list separate from the
         # effective list (file + pinned open positions).
@@ -94,6 +97,18 @@ class LegInBot:
                 refresh_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await refresh_task
+            await self._cancel_pending_tasks()
+
+    async def _cancel_pending_tasks(self) -> None:
+        tasks = list(self._tasks_by_condition.values()) + list(self._vacuum_tasks)
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks_by_condition.clear()
+        self._vacuum_tasks.clear()
 
     def _read_market_specs_file(self, path: str) -> List[MarketSpec]:
         data = json.loads(Path(path).read_text())
@@ -173,7 +188,26 @@ class LegInBot:
         last = self._last_entry_signal_at.get(condition_id)
         if last is not None and interval_s > 0 and (now - last) < interval_s:
             return False
+        active_last = int(self.config.entry_active_last_s)
+        if active_last > 0:
+            try:
+                secs_to_end = self._seconds_to_window_end(now)
+                if secs_to_end > float(active_last):
+                    return False
+            except Exception:
+                return False
         return True
+
+    def _seconds_to_window_end(self, now_ts: float) -> float:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(self.config.market_timezone)
+        now_local = _dt.datetime.fromtimestamp(now_ts, tz=tz)
+        window_minutes = int(self.config.market_window_minutes)
+        minute_bucket = (now_local.minute // window_minutes) * window_minutes
+        window_start_local = now_local.replace(minute=minute_bucket, second=0, microsecond=0)
+        window_end_local = window_start_local + _dt.timedelta(minutes=window_minutes)
+        return float((window_end_local - now_local).total_seconds())
 
     def _roll_daily_pnl(self, now: float) -> None:
         day = _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc).date()
@@ -202,14 +236,335 @@ class LegInBot:
         if self.config.market_specs_file:
             self._sync_monitor_markets()
 
+    def _set_task(self, condition_id: str, task: asyncio.Task) -> None:
+        prev = self._tasks_by_condition.get(condition_id)
+        if prev is not None and not prev.done():
+            task.cancel()
+            return
+
+        self._tasks_by_condition[condition_id] = task
+
+        def _cleanup(_t: asyncio.Task) -> None:
+            cur = self._tasks_by_condition.get(condition_id)
+            if cur is _t:
+                self._tasks_by_condition.pop(condition_id, None)
+            try:
+                exc = _t.exception()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                return
+            if exc is not None:
+                self.logger.error(
+                    "Background task failed condition=%s: %s",
+                    condition_id,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_cleanup)
+
+    def _track_vacuum_task(self, task: asyncio.Task) -> None:
+        self._vacuum_tasks.add(task)
+
+        def _cleanup(_t: asyncio.Task) -> None:
+            self._vacuum_tasks.discard(_t)
+            try:
+                exc = _t.exception()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                return
+            if exc is not None:
+                self.logger.error(
+                    "Vacuum task failed: %s",
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_cleanup)
+
+    def _schedule_vacuum_orders(self, update) -> None:
+        if not self.config.vacuum_enabled or not self.config.vacuum_prices:
+            return
+        cid = update.condition_id
+        prices = [float(p) for p in self.config.vacuum_prices]
+        for side, token_id in (("YES", update.yes_token_id), ("NO", update.no_token_id)):
+            for p in prices:
+                key = (cid, side, p)
+                if key in self._vacuum_placed:
+                    continue
+                self._vacuum_placed.add(key)
+                size = float(self.config.vacuum_usdc_per_order) / p
+                task = asyncio.create_task(
+                    self.execution_engine.place_limit_buy(
+                        condition_id=cid,
+                        side=side,
+                        token_id=token_id,
+                        price=p,
+                        size=size,
+                        action="VACUUM",
+                    )
+                )
+                self._track_vacuum_task(task)
+
+    async def _task_execute_leg_1(self, position: LegInPosition) -> None:
+        cid = position.condition_id
+        token_id = position.yes_token_id if position.leg_1_side == "YES" else position.no_token_id
+        ok = await self.execution_engine.execute_leg_1(
+            position, price_data_fn=lambda: self.monitor.get_current_price(token_id)
+        )
+        if not ok:
+            self.logger.warning("Leg 1 failed condition=%s", cid)
+            if self.positions.get(cid) is position:
+                self.positions.pop(cid, None)
+            return
+        self._entry_counts[cid] = self._entry_counts.get(cid, 0) + 1
+        position.state = PositionState.HOLDING
+
+    async def _task_arb(self, position: LegInPosition, *, yes_ask: float, no_ask: float, yes_bid: float, no_bid: float) -> None:
+        cid = position.condition_id
+        # Buy the cheaper leg first to reduce exposure if leg2 fails.
+        if yes_ask <= no_ask:
+            position.leg_1_side = "YES"
+            position.leg_1_entry_price = yes_ask
+        else:
+            position.leg_1_side = "NO"
+            position.leg_1_entry_price = no_ask
+
+        leg1_token_id = (
+            position.yes_token_id if position.leg_1_side == "YES" else position.no_token_id
+        )
+        ok1 = await self.execution_engine.execute_leg_1(
+            position, price_data_fn=lambda: self.monitor.get_current_price(leg1_token_id)
+        )
+        if not ok1:
+            self.logger.warning("ARB leg1 failed condition=%s", cid)
+            if self.positions.get(cid) is position:
+                self.positions.pop(cid, None)
+            return
+
+        self._entry_counts[cid] = self._entry_counts.get(cid, 0) + 1
+
+        opp_side = "NO" if position.leg_1_side == "YES" else "YES"
+        opp_ask = no_ask if opp_side == "NO" else yes_ask
+        opp_token_id = (
+            position.no_token_id if position.leg_1_side == "YES" else position.yes_token_id
+        )
+        ok2 = await self.execution_engine.execute_leg_2(
+            position,
+            price=float(opp_ask),
+            size=float(position.leg_1_size),
+            price_data_fn=lambda: self.monitor.get_current_price(opp_token_id),
+        )
+        if not ok2:
+            self.logger.warning("ARB leg2 failed condition=%s; attempting unwind", cid)
+            position.state = PositionState.UNWINDING
+            bid = yes_bid if position.leg_1_side == "YES" else no_bid
+            await self._task_unwind(position, price=float(bid), size=float(position.leg_1_size), action="UNWIND")
+            return
+
+        position.state = PositionState.MERGING
+        await self._task_merge(position)
+
+    async def _task_close_and_merge(self, position: LegInPosition, *, price: float, size: float) -> None:
+        cid = position.condition_id
+        position.leg_2_pending = True
+        try:
+            opp_token_id = (
+                position.no_token_id if position.leg_1_side == "YES" else position.yes_token_id
+            )
+            ok = await self.execution_engine.execute_leg_2(
+                position,
+                price=price,
+                size=size,
+                price_data_fn=lambda: self.monitor.get_current_price(opp_token_id),
+            )
+        finally:
+            position.leg_2_pending = False
+
+        if not ok:
+            self.logger.warning("Leg 2 failed condition=%s; keeping position open", cid)
+            return
+
+        position.state = PositionState.MERGING
+        position.merge_pending = True
+        try:
+            merged = await self.execution_engine.merge_tokens(position)
+        finally:
+            position.merge_pending = False
+
+        if merged:
+            leg_2_price = position.leg_2_entry_price
+            if leg_2_price is not None:
+                pnl = (1.0 - position.leg_1_entry_price - leg_2_price) * position.leg_1_size
+                self._record_pnl(pnl, condition_id=cid, action="MERGE")
+            else:
+                self.logger.warning("MERGE pnl unknown (missing leg_2_entry_price) condition=%s", cid)
+            self._finish_position(cid)
+        else:
+            self.logger.warning("MERGE failed condition=%s; keeping position open", cid)
+
+    async def _task_merge(self, position: LegInPosition) -> None:
+        cid = position.condition_id
+        position.merge_pending = True
+        try:
+            ok = await self.execution_engine.merge_tokens(position)
+        finally:
+            position.merge_pending = False
+
+        if ok:
+            leg_2_price = position.leg_2_entry_price
+            if leg_2_price is not None:
+                pnl = (1.0 - position.leg_1_entry_price - leg_2_price) * position.leg_1_size
+                self._record_pnl(pnl, condition_id=cid, action="MERGE")
+            else:
+                self.logger.warning("MERGE pnl unknown (missing leg_2_entry_price) condition=%s", cid)
+            self._finish_position(cid)
+        else:
+            self.logger.warning("MERGE failed condition=%s; keeping position open", cid)
+
+    async def _task_unwind(self, position: LegInPosition, *, price: float, size: float, action: str) -> None:
+        cid = position.condition_id
+        position.unwind_pending = True
+        try:
+            ok = await self.execution_engine.execute_unwind(position, price=price, size=size)
+        finally:
+            position.unwind_pending = False
+
+        if ok:
+            pnl = (price - position.leg_1_entry_price) * position.leg_1_size
+            self._record_pnl(pnl, condition_id=cid, action=action)
+            self._finish_position(cid)
+        else:
+            self.logger.warning("UNWIND failed condition=%s; keeping position open", cid)
+
+    async def _task_scalein(self, position: LegInPosition) -> None:
+        cid = position.condition_id
+        position.scalein_pending = True
+        try:
+            add_usdc = float(position.scalein_next_usdc or 0.0)
+            position.scalein_next_usdc = None
+            if add_usdc <= 0:
+                position.state = PositionState.HOLDING
+                return
+
+            token_id = position.yes_token_id if position.leg_1_side == "YES" else position.no_token_id
+
+            def _pd():
+                return self.monitor.get_current_price(token_id)
+
+            pd0 = _pd()
+            ref_price = float(pd0.best_ask) if pd0 is not None else float(position.leg_1_entry_price)
+            if ref_price <= 0:
+                position.state = PositionState.HOLDING
+                return
+            add_shares = add_usdc / ref_price
+
+            if self.config.use_burst_execution:
+                filled, vwap_price, _ = await self.execution_engine.execute_burst_buy(
+                    token_id=token_id,
+                    total_size=add_shares,
+                    reference_price=ref_price,
+                    max_price=None,
+                    price_fn=lambda: (p.best_ask if (p := _pd()) is not None else ref_price),
+                    best_ask_size_fn=lambda: (
+                        float(getattr(p, "best_ask_size", 0.0)) if (p := _pd()) is not None else 0.0
+                    ),
+                    stop_on_price_change=None,
+                    on_slice=(
+                        (lambda p, s: self.execution_engine._log_paper_slice_leg1(position, price=p, size=s))
+                        if (self.config.paper_trading and self.config.burst_log_slices_in_paper)
+                        else None
+                    ),
+                )
+            else:
+                ok = await self.execution_engine.place_limit_buy(
+                    condition_id=cid,
+                    side=position.leg_1_side,
+                    token_id=token_id,
+                    price=ref_price,
+                    size=add_shares,
+                    action="SCALEIN",
+                    order_type="FOK",
+                )
+                if not ok:
+                    filled = 0.0
+                    vwap_price = float("nan")
+                else:
+                    filled = float(add_shares)
+                    vwap_price = float(ref_price)
+
+            if filled <= 0:
+                position.state = PositionState.HOLDING
+                return
+
+            old_shares = float(position.leg_1_size)
+            old_price = float(position.leg_1_entry_price)
+            new_total_shares = old_shares + float(filled)
+            new_avg = ((old_price * old_shares) + (float(vwap_price) * float(filled))) / new_total_shares
+            position.leg_1_size = new_total_shares
+            position.leg_1_entry_price = new_avg
+            position.scalein_count += 1
+            position.last_scalein_at = time.time()
+            position.state = PositionState.HOLDING
+        finally:
+            position.scalein_pending = False
+
     async def _handle_update(self, update) -> None:
         cid = update.condition_id
+        self._schedule_vacuum_orders(update)
         position = self.positions.get(cid)
 
         if position is None:
             now = time.time()
             if not self._entry_allowed(cid, now):
                 return
+
+            if self.config.arb_enabled:
+                yes_ask = float(update.prices["YES"].best_ask)
+                no_ask = float(update.prices["NO"].best_ask)
+                entry_exit_cost = yes_ask + no_ask
+                if (
+                    yes_ask > 0
+                    and no_ask > 0
+                    and entry_exit_cost > 0
+                    and entry_exit_cost <= float(self.config.arb_max_entry_exit_cost)
+                ):
+                    shares = float(self.config.arb_budget_usdc) / entry_exit_cost
+                    self.logger.info(
+                        "ARB signal condition=%s cost=%.4f shares=%.4f yes_ask=%.4f no_ask=%.4f",
+                        cid,
+                        entry_exit_cost,
+                        shares,
+                        yes_ask,
+                        no_ask,
+                    )
+                    self._last_entry_signal_at[cid] = now
+                    pos = LegInPosition(
+                        condition_id=cid,
+                        yes_token_id=update.yes_token_id,
+                        no_token_id=update.no_token_id,
+                        leg_1_side="YES",
+                        leg_1_entry_price=yes_ask,
+                        leg_1_size=shares,
+                        leg_1_filled=False,
+                        state=PositionState.ENTERING_LEG_1,
+                        entry_time=now,
+                    )
+                    self.positions[cid] = pos
+                    task = asyncio.create_task(
+                        self._task_arb(
+                            pos,
+                            yes_ask=yes_ask,
+                            no_ask=no_ask,
+                            yes_bid=float(update.prices["YES"].best_bid),
+                            no_bid=float(update.prices["NO"].best_bid),
+                        )
+                    )
+                    self._set_task(cid, task)
+                    return
+
             new_pos = self.position_manager.evaluate_entry(update)
             if new_pos:
                 opp_side = "NO" if new_pos.leg_1_side == "YES" else "YES"
@@ -224,12 +579,8 @@ class LegInBot:
                 )
                 self._last_entry_signal_at[cid] = now
                 self.positions[cid] = new_pos
-                ok = await self.execution_engine.execute_leg_1(new_pos)
-                if not ok:
-                    self.logger.warning("Leg 1 failed condition=%s", cid)
-                    self.positions.pop(cid, None)
-                else:
-                    self._entry_counts[cid] = self._entry_counts.get(cid, 0) + 1
+                task = asyncio.create_task(self._task_execute_leg_1(new_pos))
+                self._set_task(cid, task)
             return
 
         prev_state = position.state
@@ -260,13 +611,24 @@ class LegInBot:
                 price,
                 size,
             )
-            position.leg_2_pending = True
-            try:
-                await self.execution_engine.execute_leg_2(position, price=price, size=size)
-            finally:
-                position.leg_2_pending = False
+            task = asyncio.create_task(self._task_close_and_merge(position, price=price, size=size))
+            self._set_task(cid, task)
 
-        if state == PositionState.UNWINDING:
+        if state == PositionState.TAKE_PROFIT and not position.unwind_pending:
+            price = update.prices[position.leg_1_side].best_bid
+            self.logger.info(
+                "TAKE_PROFIT condition=%s sell=%s bid=%.4f size=%.4f",
+                cid,
+                position.leg_1_side,
+                price,
+                position.leg_1_size,
+            )
+            task = asyncio.create_task(
+                self._task_unwind(position, price=price, size=position.leg_1_size, action="CHURN")
+            )
+            self._set_task(cid, task)
+
+        if state == PositionState.UNWINDING and not position.unwind_pending:
             price = update.prices[position.leg_1_side].best_bid
             self.logger.info(
                 "UNWIND condition=%s sell=%s bid=%.4f size=%.4f",
@@ -275,29 +637,28 @@ class LegInBot:
                 price,
                 position.leg_1_size,
             )
-            ok = await self.execution_engine.execute_unwind(
-                position, price=price, size=position.leg_1_size
+            task = asyncio.create_task(
+                self._task_unwind(position, price=price, size=position.leg_1_size, action="UNWIND")
             )
-            if ok:
-                pnl = (price - position.leg_1_entry_price) * position.leg_1_size
-                self._record_pnl(pnl, condition_id=cid, action="UNWIND")
-                self._finish_position(cid)
-            else:
-                self.logger.warning("UNWIND failed condition=%s; keeping position open", cid)
+            self._set_task(cid, task)
 
-        if state == PositionState.MERGING:
+        if state == PositionState.SCALING_IN and not position.scalein_pending:
+            add_usdc = float(position.scalein_next_usdc or 0.0)
+            my_ask = update.prices[position.leg_1_side].best_ask
+            self.logger.info(
+                "SCALEIN condition=%s side=%s ask=%.4f add_usdc=%.4f",
+                cid,
+                position.leg_1_side,
+                my_ask,
+                add_usdc,
+            )
+            task = asyncio.create_task(self._task_scalein(position))
+            self._set_task(cid, task)
+
+        if state == PositionState.MERGING and not position.merge_pending:
             self.logger.info("MERGE condition=%s", cid)
-            ok = await self.execution_engine.merge_tokens(position)
-            if ok:
-                leg_2_price = position.leg_2_entry_price
-                if leg_2_price is not None:
-                    pnl = (1.0 - position.leg_1_entry_price - leg_2_price) * position.leg_1_size
-                    self._record_pnl(pnl, condition_id=cid, action="MERGE")
-                else:
-                    self.logger.warning("MERGE pnl unknown (missing leg_2_entry_price) condition=%s", cid)
-                self._finish_position(cid)
-            else:
-                self.logger.warning("MERGE failed condition=%s; keeping position open", cid)
+            task = asyncio.create_task(self._task_merge(position))
+            self._set_task(cid, task)
 
 
 async def main() -> None:
