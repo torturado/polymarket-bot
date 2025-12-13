@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from .config import Config
 from .utils.market_utils import MarketUpdate, opposite_side
@@ -38,19 +38,46 @@ class LegInPosition:
 class PositionManager:
     def __init__(self, config: Config):
         self.config = config
+        self._ema: Dict[Tuple[str, str], float] = {}
+        self._ema_samples: Dict[Tuple[str, str], int] = {}
+
+    def _update_ema(self, condition_id: str, side: str, price: float) -> Tuple[float, int]:
+        key = (condition_id, side)
+        prev = self._ema.get(key)
+        if prev is None:
+            ema = price
+            samples = 1
+        else:
+            a = float(self.config.ema_alpha)
+            ema = (a * price) + ((1.0 - a) * prev)
+            samples = self._ema_samples.get(key, 1) + 1
+        self._ema[key] = ema
+        self._ema_samples[key] = samples
+        return ema, samples
 
     def evaluate_entry(self, market_data: MarketUpdate) -> Optional[LegInPosition]:
         yes_ask = market_data.prices["YES"].best_ask
         no_ask = market_data.prices["NO"].best_ask
+
+        yes_ema, yes_samples = self._update_ema(market_data.condition_id, "YES", yes_ask)
+        no_ema, no_samples = self._update_ema(market_data.condition_id, "NO", no_ask)
 
         if max(yes_ask, no_ask) > self.config.max_opposite_ask_for_entry:
             return None
 
         candidates = []
         if yes_ask < self.config.entry_threshold:
-            candidates.append(("YES", yes_ask, no_ask))
+            allow = True
+            if self.config.use_ema_crash_filter and yes_samples >= self.config.ema_min_samples:
+                allow = yes_ask <= (yes_ema * self.config.ema_crash_ratio)
+            if allow:
+                candidates.append(("YES", yes_ask, no_ask))
         if no_ask < self.config.entry_threshold:
-            candidates.append(("NO", no_ask, yes_ask))
+            allow = True
+            if self.config.use_ema_crash_filter and no_samples >= self.config.ema_min_samples:
+                allow = no_ask <= (no_ema * self.config.ema_crash_ratio)
+            if allow:
+                candidates.append(("NO", no_ask, yes_ask))
         if not candidates:
             return None
 

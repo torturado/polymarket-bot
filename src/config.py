@@ -85,6 +85,7 @@ class Config:
     min_spread_basis_points: int = 0
     max_entry_side_spread: float = 0.03
     book_depth_levels: int = 5
+    min_safe_price: float = 0.05
 
     # Paper Trading
     paper_trading: bool = True
@@ -99,6 +100,12 @@ class Config:
 
     # Monitoring
     polling_interval_ms: int = 250
+
+    # Entry signal (optional EMA crash filter)
+    use_ema_crash_filter: bool = False
+    ema_alpha: float = 0.2
+    ema_crash_ratio: float = 0.9
+    ema_min_samples: int = 10
 
     # Markets to watch
     # Provide either MARKETS as comma-separated condition IDs with a
@@ -187,6 +194,7 @@ class Config:
             max_entries_per_condition=_get_int(
                 "MAX_ENTRIES_PER_CONDITION", cls.max_entries_per_condition
             ),
+            min_safe_price=_get_float("MIN_SAFE_PRICE", cls.min_safe_price),
             reentry_cooldown_s=_get_float(
                 "REENTRY_COOLDOWN_S",
                 _get_float("PER_CONDITION_LOCK_SECONDS", cls.reentry_cooldown_s),
@@ -198,6 +206,12 @@ class Config:
             polling_interval_ms=_get_int(
                 "POLLING_INTERVAL_MS", cls.polling_interval_ms
             ),
+            use_ema_crash_filter=_get_bool(
+                "USE_EMA_CRASH_FILTER", cls.use_ema_crash_filter
+            ),
+            ema_alpha=_get_float("EMA_ALPHA", cls.ema_alpha),
+            ema_crash_ratio=_get_float("EMA_CRASH_RATIO", cls.ema_crash_ratio),
+            ema_min_samples=_get_int("EMA_MIN_SAMPLES", cls.ema_min_samples),
             markets=markets,
             market_specs=market_specs,
             market_specs_file=_get_env("MARKET_SPECS_FILE"),

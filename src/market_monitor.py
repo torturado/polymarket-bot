@@ -37,11 +37,21 @@ class MarketMonitor:
         Update the list of markets being monitored. In WS mode this will trigger
         a reconnect + resubscribe on the next tick.
         """
+        prev_markets = list(self.markets)
         self.markets = markets
         self._condition_to_pair = {
             m.condition_id: (m.yes_token_id, m.no_token_id) for m in markets
         }
         if trigger_resubscribe and self.config.use_websocket:
+            prev_assets = {t for m in prev_markets for t in (m.yes_token_id, m.no_token_id)}
+            new_assets = {t for m in markets for t in (m.yes_token_id, m.no_token_id)}
+            self.logger.info(
+                "WS resubscribe requested: markets=%d assets=%d (was markets=%d assets=%d)",
+                len(markets),
+                len(new_assets),
+                len(prev_markets),
+                len(prev_assets),
+            )
             self._resubscribe_event.set()
 
     def get_current_price(self, token_id: str):
