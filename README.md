@@ -43,6 +43,13 @@ Opciones útiles:
 venv/bin/python src/leg_in_bot.py
 ```
 
+**5) Dashboard (UI web)**
+Lanza el bot + una UI en localhost (tablas de mercados/posiciones y feed de eventos):
+```bash
+venv/bin/python src/dashboard.py
+```
+Abre `http://127.0.0.1:8000` (ajusta `DASHBOARD_HOST/DASHBOARD_PORT` en `.env` si quieres).
+
 Notas:
 - El subscribe al WS se genera automáticamente a partir de `market_specs.json`.
 - `merge_tokens()` para live trading sigue pendiente (stub).
