@@ -66,6 +66,15 @@ class LegInBot:
         self.execution_engine = ExecutionEngine(self.client, self.config)
 
         self.telemetry = telemetry
+        if self.telemetry:
+            for spec in self.market_specs:
+                self.telemetry.set_market_meta(
+                    spec.condition_id,
+                    label=spec.label,
+                    event_slug=spec.event_slug,
+                    start_epoch_utc=spec.start_epoch_utc,
+                    strike_price=spec.strike_price,
+                )
 
         self.positions: Dict[str, LegInPosition] = {}
         self._cooldown_until: Dict[str, float] = {}
@@ -77,6 +86,11 @@ class LegInBot:
         self._tasks_by_condition: Dict[str, asyncio.Task] = {}
         self._vacuum_placed: set[tuple[str, str, float]] = set()
         self._vacuum_tasks: set[asyncio.Task] = set()
+
+        self._paper_balance: float = float(self.config.paper_initial_balance)
+        self._paper_out_of_funds_logged: bool = False
+        if self.config.paper_trading:
+            self.logger.info("PAPER balance initialized: %.4f USDC", self._paper_balance)
 
         # If using MARKET_SPECS_FILE, keep the file list separate from the
         # effective list (file + pinned open positions).
@@ -179,6 +193,28 @@ class LegInBot:
 
     def _entry_allowed(self, condition_id: str, now: float) -> bool:
         self._roll_daily_pnl(now)
+        if self.config.paper_trading:
+            if self._paper_balance <= 0:
+                if not self._paper_out_of_funds_logged:
+                    self._paper_out_of_funds_logged = True
+                    self.logger.warning("PAPER out of funds: balance=%.4f; disabling new entries", self._paper_balance)
+                    if self.telemetry:
+                        self.telemetry.emit("paper_out_of_funds", balance=float(self._paper_balance))
+                return False
+
+            # Block entries if we can't cover an estimated leg-1 budget.
+            required = float(self.config.max_position_size) * float(self.config.initial_entry_fraction)
+            if self._paper_balance < required:
+                if self.telemetry:
+                    self.telemetry.emit(
+                        "paper_insufficient_funds",
+                        condition_id=condition_id,
+                        balance=float(self._paper_balance),
+                        required=float(required),
+                        kind="entry",
+                    )
+                return False
+
         if self.config.max_daily_loss > 0 and self._daily_pnl_usdc <= -float(self.config.max_daily_loss):
             if not self._daily_loss_tripped:
                 self._daily_loss_tripped = True
@@ -208,6 +244,56 @@ class LegInBot:
             except Exception:
                 return False
         return True
+
+    def _paper_debit(self, amount_usdc: float, *, condition_id: str, action: str) -> bool:
+        if not self.config.paper_trading:
+            return True
+        amt = float(amount_usdc)
+        if amt <= 0:
+            return True
+        if self._paper_balance < amt:
+            self.logger.warning(
+                "PAPER insufficient funds: action=%s condition=%s need=%.4f balance=%.4f",
+                action,
+                condition_id,
+                amt,
+                self._paper_balance,
+            )
+            if self.telemetry:
+                self.telemetry.emit(
+                    "paper_insufficient_funds",
+                    condition_id=condition_id,
+                    balance=float(self._paper_balance),
+                    required=float(amt),
+                    kind=action,
+                )
+            return False
+        self._paper_balance -= amt
+        if self.telemetry:
+            self.telemetry.emit(
+                "paper_balance",
+                condition_id=condition_id,
+                action=action,
+                delta_usdc=-amt,
+                balance_usdc=float(self._paper_balance),
+            )
+        return True
+
+    def _paper_credit(self, amount_usdc: float, *, condition_id: str, action: str) -> None:
+        if not self.config.paper_trading:
+            return
+        amt = float(amount_usdc)
+        if amt <= 0:
+            return
+        self._paper_balance += amt
+        if self.telemetry:
+            self.telemetry.emit(
+                "paper_balance",
+                condition_id=condition_id,
+                action=action,
+                delta_usdc=amt,
+                balance_usdc=float(self._paper_balance),
+            )
 
     def _seconds_to_window_end(self, now_ts: float) -> float:
         from zoneinfo import ZoneInfo
@@ -324,6 +410,12 @@ class LegInBot:
                 key = (cid, side, p)
                 if key in self._vacuum_placed:
                     continue
+
+                if self.config.paper_trading:
+                    usdc = float(self.config.vacuum_usdc_per_order)
+                    if not self._paper_debit(usdc, condition_id=cid, action="VACUUM_RESERVE"):
+                        return
+
                 self._vacuum_placed.add(key)
                 size = float(self.config.vacuum_usdc_per_order) / p
                 task = asyncio.create_task(
@@ -366,6 +458,14 @@ class LegInBot:
             if self.positions.get(cid) is position:
                 self.positions.pop(cid, None)
             return
+
+        if self.config.paper_trading:
+            cost = float(position.leg_1_entry_price) * float(position.leg_1_size)
+            if not self._paper_debit(cost, condition_id=cid, action="BUY_LEG1"):
+                if self.positions.get(cid) is position:
+                    self.positions.pop(cid, None)
+                return
+
         self._entry_counts[cid] = self._entry_counts.get(cid, 0) + 1
         position.state = PositionState.HOLDING
         if self.telemetry:
@@ -399,6 +499,13 @@ class LegInBot:
                 self.positions.pop(cid, None)
             return
 
+        if self.config.paper_trading:
+            cost1 = float(position.leg_1_entry_price) * float(position.leg_1_size)
+            if not self._paper_debit(cost1, condition_id=cid, action="BUY_ARB_LEG1"):
+                if self.positions.get(cid) is position:
+                    self.positions.pop(cid, None)
+                return
+
         self._entry_counts[cid] = self._entry_counts.get(cid, 0) + 1
 
         opp_side = "NO" if position.leg_1_side == "YES" else "YES"
@@ -426,6 +533,17 @@ class LegInBot:
             bid = yes_bid if position.leg_1_side == "YES" else no_bid
             await self._task_unwind(position, price=float(bid), size=float(position.leg_1_size), action="UNWIND")
             return
+
+        if self.config.paper_trading:
+            cost2 = float(position.leg_2_entry_price or opp_ask) * float(position.leg_2_size or position.leg_1_size)
+            if not self._paper_debit(cost2, condition_id=cid, action="BUY_ARB_LEG2"):
+                # Can't fund leg2: unwind leg1 immediately.
+                position.state = PositionState.UNWINDING
+                bid = yes_bid if position.leg_1_side == "YES" else no_bid
+                await self._task_unwind(
+                    position, price=float(bid), size=float(position.leg_1_size), action="UNWIND"
+                )
+                return
 
         position.state = PositionState.MERGING
         if self.telemetry:
@@ -460,6 +578,16 @@ class LegInBot:
             self.logger.warning("Leg 2 failed condition=%s; keeping position open", cid)
             return
 
+        if self.config.paper_trading:
+            cost2 = float(position.leg_2_entry_price or price) * float(position.leg_2_size or size)
+            if not self._paper_debit(cost2, condition_id=cid, action="BUY_LEG2"):
+                self.logger.warning("PAPER cannot fund leg2 condition=%s; skipping merge", cid)
+                position.leg_2_filled = False
+                position.leg_2_entry_price = None
+                position.leg_2_size = None
+                position.state = PositionState.HOLDING
+                return
+
         position.state = PositionState.MERGING
         if self.telemetry:
             self.telemetry.emit("merge_start", condition_id=cid)
@@ -470,6 +598,12 @@ class LegInBot:
             position.merge_pending = False
 
         if merged:
+            if self.config.paper_trading:
+                amount = min(
+                    float(position.leg_1_size),
+                    float(position.leg_2_size if position.leg_2_size is not None else position.leg_1_size),
+                )
+                self._paper_credit(amount * 1.0, condition_id=cid, action="MERGE")
             leg_2_price = position.leg_2_entry_price
             if leg_2_price is not None:
                 pnl = (1.0 - position.leg_1_entry_price - leg_2_price) * position.leg_1_size
@@ -491,6 +625,12 @@ class LegInBot:
             position.merge_pending = False
 
         if ok:
+            if self.config.paper_trading:
+                amount = min(
+                    float(position.leg_1_size),
+                    float(position.leg_2_size if position.leg_2_size is not None else position.leg_1_size),
+                )
+                self._paper_credit(amount * 1.0, condition_id=cid, action="MERGE")
             leg_2_price = position.leg_2_entry_price
             if leg_2_price is not None:
                 pnl = (1.0 - position.leg_1_entry_price - leg_2_price) * position.leg_1_size
@@ -519,6 +659,9 @@ class LegInBot:
             position.unwind_pending = False
 
         if ok:
+            if self.config.paper_trading:
+                revenue = float(price) * float(size)
+                self._paper_credit(revenue, condition_id=cid, action=f"SELL_{action}")
             pnl = (price - position.leg_1_entry_price) * position.leg_1_size
             self._record_pnl(pnl, condition_id=cid, action=action)
             self._finish_position(cid)
@@ -635,6 +778,18 @@ class LegInBot:
                     and entry_exit_cost > 0
                     and entry_exit_cost <= float(self.config.arb_max_entry_exit_cost)
                 ):
+                    if self.config.paper_trading:
+                        budget = float(self.config.arb_budget_usdc)
+                        if self._paper_balance < budget:
+                            if self.telemetry:
+                                self.telemetry.emit(
+                                    "paper_insufficient_funds",
+                                    condition_id=cid,
+                                    balance=float(self._paper_balance),
+                                    required=float(budget),
+                                    kind="arb",
+                                )
+                            return
                     shares = float(self.config.arb_budget_usdc) / entry_exit_cost
                     self.logger.info(
                         "ARB signal condition=%s cost=%.4f shares=%.4f yes_ask=%.4f no_ask=%.4f",
@@ -759,6 +914,25 @@ class LegInBot:
                 price,
                 size,
             )
+            if self.config.paper_trading:
+                est_cost = float(price) * float(size)
+                if self._paper_balance < est_cost:
+                    self.logger.warning(
+                        "PAPER cannot afford leg2: condition=%s need=%.4f balance=%.4f",
+                        cid,
+                        est_cost,
+                        self._paper_balance,
+                    )
+                    if self.telemetry:
+                        self.telemetry.emit(
+                            "paper_insufficient_funds",
+                            condition_id=cid,
+                            balance=float(self._paper_balance),
+                            required=float(est_cost),
+                            kind="close_leg2",
+                        )
+                    position.state = PositionState.HOLDING
+                    return
             task = asyncio.create_task(self._task_close_and_merge(position, price=price, size=size))
             self._set_task(cid, task)
 
@@ -800,6 +974,24 @@ class LegInBot:
                 my_ask,
                 add_usdc,
             )
+            if self.config.paper_trading and add_usdc > 0 and self._paper_balance < add_usdc:
+                self.logger.warning(
+                    "PAPER cannot afford scale-in: condition=%s need=%.4f balance=%.4f",
+                    cid,
+                    add_usdc,
+                    self._paper_balance,
+                )
+                position.scalein_next_usdc = None
+                position.state = PositionState.HOLDING
+                if self.telemetry:
+                    self.telemetry.emit(
+                        "paper_insufficient_funds",
+                        condition_id=cid,
+                        balance=float(self._paper_balance),
+                        required=float(add_usdc),
+                        kind="scalein",
+                    )
+                return
             task = asyncio.create_task(self._task_scalein(position))
             self._set_task(cid, task)
 

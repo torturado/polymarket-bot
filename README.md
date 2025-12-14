@@ -53,3 +53,6 @@ Abre `http://127.0.0.1:8000` (ajusta `DASHBOARD_HOST/DASHBOARD_PORT` en `.env` s
 Notas:
 - El subscribe al WS se genera automáticamente a partir de `market_specs.json`.
 - `merge_tokens()` para live trading sigue pendiente (stub).
+
+Paper trading:
+- `PAPER_INITIAL_BALANCE` controla el saldo inicial de la billetera virtual (el bot bloquea nuevas entradas si no alcanza).

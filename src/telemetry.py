@@ -23,6 +23,20 @@ class Telemetry:
         self._events: Deque[TelemetryEvent] = deque(maxlen=max(int(max_events), 1))
         self._subscribers: Set[asyncio.Queue] = set()
         self._markets: Dict[str, Dict[str, Any]] = {}
+        self._market_meta: Dict[str, Dict[str, Any]] = {}
+
+    def set_market_meta(self, condition_id: str, **meta: Any) -> None:
+        cid = str(condition_id)
+        clean: Dict[str, Any] = {}
+        for k, v in meta.items():
+            if v is None:
+                continue
+            clean[str(k)] = v
+        if not clean:
+            return
+        cur = self._market_meta.get(cid) or {}
+        cur.update(clean)
+        self._market_meta[cid] = cur
 
     def ingest_market_update(self, update: MarketUpdate) -> None:
         cid = update.condition_id
@@ -30,7 +44,9 @@ class Telemetry:
         no = update.prices.get("NO")
         if yes is None or no is None:
             return
+        meta = dict(self._market_meta.get(cid) or {})
         self._markets[cid] = {
+            **meta,
             "condition_id": cid,
             "received_at": float(update.received_at),
             "yes_token_id": update.yes_token_id,
@@ -97,4 +113,3 @@ class Telemetry:
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._subscribers.discard(q)
-

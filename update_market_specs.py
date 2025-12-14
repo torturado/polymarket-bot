@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config import Config  # noqa: E402
+from src.utils.market_utils import extract_strike_price  # noqa: E402
 
 
 DEFAULT_OUTPUT = "market_specs.json"
@@ -40,6 +41,9 @@ class SelectedMarket:
     condition_id: str
     yes_token_id: str
     no_token_id: str
+    event_slug: Optional[str] = None
+    start_epoch_utc: Optional[int] = None
+    strike_price: Optional[float] = None
 
 
 @dataclass
@@ -447,16 +451,29 @@ def build_market_specs(
             stats.scanned += 1
             stats.active += 1  # gamma already filtered
             event_lbl = _event_label(event)
+            event_slug = event.get("slug") if isinstance(event.get("slug"), str) else None
+            event_start_epoch = (
+                _extract_epoch_suffix(event.get("ticker"))
+                or _extract_epoch_suffix(event.get("slug"))
+                or _parse_iso8601_to_epoch(event.get("startTime"))
+            )
+            event_strike = extract_strike_price(
+                " ".join(
+                    str(v)
+                    for v in (
+                        event.get("title"),
+                        event.get("description"),
+                        event.get("ticker"),
+                        event.get("slug"),
+                    )
+                    if isinstance(v, str)
+                )
+            )
             if sample_size > 0 and len(stats.sample_labels) < sample_size and event_lbl not in seen_samples:
                 stats.sample_labels.append(event_lbl)
                 seen_samples.add(event_lbl)
 
             if filter_current_window and window_start_epoch_utc is not None:
-                event_start_epoch = (
-                    _extract_epoch_suffix(event.get("ticker"))
-                    or _extract_epoch_suffix(event.get("slug"))
-                    or _parse_iso8601_to_epoch(event.get("startTime"))
-                )
                 if event_start_epoch != window_start_epoch_utc:
                     continue
                 stats.window_matched += 1
@@ -506,12 +523,17 @@ def build_market_specs(
                     continue
 
                 yes_token_id, no_token_id = token_ids[0], token_ids[1]
+                market_strike = extract_strike_price(" ".join(_market_text_fields(m)))
+                strike = market_strike if market_strike is not None else event_strike
                 selected.append(
                     SelectedMarket(
                         label=event_lbl,
                         condition_id=condition_id,
                         yes_token_id=yes_token_id,
                         no_token_id=no_token_id,
+                        event_slug=event_slug,
+                        start_epoch_utc=event_start_epoch,
+                        strike_price=strike,
                     )
                 )
                 stats.selected += 1
@@ -559,12 +581,17 @@ def build_market_specs(
             continue
 
         yes_token_id, no_token_id = tokens
+        strike = extract_strike_price(" ".join(_market_text_fields(market)))
         selected.append(
             SelectedMarket(
                 label=_market_label(market),
                 condition_id=condition_id,
                 yes_token_id=yes_token_id,
                 no_token_id=no_token_id,
+                event_slug=str(market.get("slug") or market.get("ticker") or "") or None,
+                start_epoch_utc=_extract_epoch_suffix(market.get("slug"))
+                or _extract_epoch_suffix(market.get("ticker")),
+                strike_price=strike,
             )
         )
         stats.selected += 1
@@ -574,7 +601,7 @@ def build_market_specs(
     return selected, stats
 
 
-def write_specs(path: str, specs: List[Dict[str, str]]) -> None:
+def write_specs(path: str, specs: List[Dict[str, Any]]) -> None:
     out = Path(path)
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_text(json.dumps(specs, indent=2))
@@ -658,9 +685,31 @@ def main() -> None:
         )
         specs = [
             {
-                "condition_id": m.condition_id,
-                "yes_token_id": m.yes_token_id,
-                "no_token_id": m.no_token_id,
+                **{
+                    "condition_id": m.condition_id,
+                    "yes_token_id": m.yes_token_id,
+                    "no_token_id": m.no_token_id,
+                },
+                **(
+                    {"label": m.label}
+                    if m.label
+                    else {}
+                ),
+                **(
+                    {"event_slug": m.event_slug}
+                    if m.event_slug
+                    else {}
+                ),
+                **(
+                    {"start_epoch_utc": int(m.start_epoch_utc)}
+                    if m.start_epoch_utc is not None
+                    else {}
+                ),
+                **(
+                    {"strike_price": float(m.strike_price)}
+                    if m.strike_price is not None
+                    else {}
+                ),
             }
             for m in selected
         ]

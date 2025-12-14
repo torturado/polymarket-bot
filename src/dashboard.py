@@ -70,6 +70,10 @@ INDEX_HTML = """<!doctype html>
       <div class="content">
         <div class="kpis">
           <div class="kpi">
+            <div class="label">Wallet Balance (USDC)</div>
+            <div id="walletBal" class="value" style="color:#ffd36a;">0.0000</div>
+          </div>
+          <div class="kpi">
             <div class="label">Daily PnL (USDC)</div>
             <div id="dailyPnl" class="value">0.0000</div>
           </div>
@@ -137,6 +141,7 @@ INDEX_HTML = """<!doctype html>
   <script>
     const elConn = document.getElementById('conn');
     const elDaily = document.getElementById('dailyPnl');
+    const elWallet = document.getElementById('walletBal');
     const elOpen = document.getElementById('openPositions');
     const elMarketsSeen = document.getElementById('marketsSeen');
     const elLastSnap = document.getElementById('lastSnap');
@@ -189,10 +194,10 @@ INDEX_HTML = """<!doctype html>
       for (const m of markets || []) {
         const tr = document.createElement('tr');
         tr.innerHTML = `
-          <td class="mono">${shortId(m.condition_id)}</td>
+          <td class="mono">${shortId(m.condition_id)}<div class="muted">${m.label ? String(m.label).slice(0, 42) : ''}</div></td>
           <td>${fmt(m.yes?.best_bid)} / ${fmt(m.yes?.best_ask)}</td>
           <td>${fmt(m.no?.best_bid)} / ${fmt(m.no?.best_ask)}</td>
-          <td>${fmt(m.sum_ask)}</td>
+          <td>${fmt(m.sum_ask)}<div class="muted">strike: ${fmt(m.strike_price, 2)}</div></td>
         `;
         marketsTbody.appendChild(tr);
       }
@@ -218,6 +223,9 @@ INDEX_HTML = """<!doctype html>
     }
 
     function renderSnapshot(s) {
+      if (s.paper_balance !== undefined) {
+        elWallet.textContent = fmt(s.paper_balance);
+      }
       elDaily.textContent = fmt(s.daily_pnl_usdc);
       elDaily.className = 'value ' + ((s.daily_pnl_usdc || 0) >= 0 ? 'pos' : 'neg');
       elOpen.textContent = fmtInt(s.open_positions);
@@ -283,6 +291,7 @@ def _build_snapshot(bot: LegInBot, telemetry: Telemetry) -> Dict[str, Any]:
     return {
         "now": time.time(),
         "daily_pnl_usdc": float(getattr(bot, "_daily_pnl_usdc", 0.0) or 0.0),
+        "paper_balance": float(getattr(bot, "_paper_balance", 0.0) or 0.0),
         "open_positions": int(len(bot.positions)),
         "markets_seen": int(len(markets)),
         "positions": positions,
@@ -398,4 +407,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-

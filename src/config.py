@@ -182,6 +182,7 @@ class Config:
     # Paper Trading
     paper_trading: bool = True
     paper_trades_log: str = "paper_trades.csv"
+    paper_initial_balance: float = 100.0
 
     # Risk Management
     max_concurrent_positions: int = 5
@@ -356,6 +357,9 @@ class Config:
             or cls.vacuum_order_type,
             paper_trading=_get_bool("PAPER_TRADING", cls.paper_trading),
             paper_trades_log=_get_env("PAPER_TRADES_LOG", cls.paper_trades_log),
+            paper_initial_balance=_get_float(
+                "PAPER_INITIAL_BALANCE", cls.paper_initial_balance
+            ),
             max_concurrent_positions=_get_int(
                 "MAX_CONCURRENT_POSITIONS", cls.max_concurrent_positions
             ),
@@ -410,6 +414,9 @@ class Config:
 
         if not (0.0 < float(self.initial_entry_fraction) <= 1.0):
             raise ValueError("INITIAL_ENTRY_FRACTION must be within (0, 1]")
+
+        if self.paper_trading and float(self.paper_initial_balance) < 0:
+            raise ValueError("PAPER_INITIAL_BALANCE must be >= 0")
 
         if int(self.entry_active_last_s) < 0:
             raise ValueError("ENTRY_ACTIVE_LAST_S must be >= 0")
