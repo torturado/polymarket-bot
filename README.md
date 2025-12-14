@@ -56,3 +56,8 @@ Notas:
 
 Paper trading:
 - `PAPER_INITIAL_BALANCE` controla el saldo inicial de la billetera virtual (el bot bloquea nuevas entradas si no alcanza).
+
+**6) Migración a Rust (WIP)**
+Si quieres pasar a ejecución de baja latencia (manteniendo Python para datos/análisis), mira:
+- `RUST_MIGRATION.md` (motivación + roadmap).
+- `polymarket-rust-bot/` (starter Rust: WS monitor + detector de ARB, sin órdenes reales todavía).

@@ -40,3 +40,6 @@ paper_trades.csv
 .env.local
 .env.*
 !.env.example
+
+# Rust
+target/
