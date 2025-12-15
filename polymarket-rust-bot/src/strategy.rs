@@ -509,6 +509,17 @@ pub async fn run(
 
         let is_atomic_arb = total_cost_now <= target_cost + 1e-12;
         if !is_atomic_arb {
+            let gamma_guard_s = 180.0;
+            if let Some(s) = time_to_expiry_s(&update, &config) {
+                if s < gamma_guard_s {
+                    debug!(
+                        "Skipping Leg-In entry due to Gamma risk: condition={} tte_s={:.1} < {:.1}",
+                        cid, s, gamma_guard_s
+                    );
+                    continue;
+                }
+            }
+
             let max_leg_in_cost = config.max_leg_in_entry_cost;
             if selected_by_fair_value && max_leg_in_cost > 0.0 && total_cost_now <= max_leg_in_cost + 1e-12 {
                 debug!(
@@ -524,16 +535,8 @@ pub async fn run(
             }
         }
 
-        let sizing_cost = if is_atomic_arb {
-            target_cost
-        } else {
-            config.max_leg_in_entry_cost
-        };
-        if !(sizing_cost.is_finite() && sizing_cost > 0.0) {
-            continue;
-        }
-
-        let shares_target = budget / sizing_cost;
+        let execution_price_basis = total_cost_now.max(0.01);
+        let shares_target = budget / execution_price_basis;
         if !shares_target.is_finite() || shares_target <= 0.0 {
             continue;
         }
