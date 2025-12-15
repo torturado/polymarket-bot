@@ -1,10 +1,12 @@
 use crate::config::Config;
 use crate::execution::{ExecutionEngine, PriceStore};
+use crate::fair_value::fair_prob_up;
+use crate::oracle::{self, OracleStore};
 use crate::paper::{PaperTradeLogger, PaperWallet};
 use crate::position_manager::{LegInPosition, PositionManager, PositionState};
 use crate::types::{now_s, MarketUpdate, PriceData};
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
@@ -16,6 +18,7 @@ pub async fn run(
     mut rx: Receiver<MarketUpdate>,
     config: Arc<Config>,
     position_manager: Arc<PositionManager>,
+    oracle_store: OracleStore,
 ) -> Result<()> {
     let prices: PriceStore = Arc::new(RwLock::new(HashMap::<String, PriceData>::new()));
 
@@ -42,6 +45,7 @@ pub async fn run(
 
     let state = Arc::new(Mutex::new(RiskState::new(now_s())));
     let mut tasks_by_condition: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let mut strike_cache: HashMap<String, f64> = HashMap::new();
 
     while let Some(update) = rx.recv().await {
         // Keep an in-memory price store for burst simulation and unwind pricing.
@@ -66,6 +70,54 @@ pub async fn run(
         let no_ask = update.no.best_ask;
         if yes_ask <= 0.0 || no_ask <= 0.0 {
             continue;
+        }
+
+        // Best-effort strike capture:
+        // 1) Prefer strike_price from Gamma.
+        // 2) Fallback to parsing event_slug (eg "btc-above-98500-1230") if present.
+        // 3) Fallback to oracle spot around window start (strike is fixed at start_epoch_utc for 15m Up/Down).
+        if let Some(strike) = update.strike_price {
+            strike_cache.insert(cid.clone(), strike);
+        }
+
+        if !strike_cache.contains_key(&cid) {
+            for raw in [update.event_slug.as_deref(), update.label.as_deref()] {
+                let Some(raw) = raw else {
+                    continue;
+                };
+                if let Some(strike) = infer_strike_from_slug(raw) {
+                    strike_cache.insert(cid.clone(), strike);
+                    debug!(
+                        "Inferred strike from slug/label: condition={} strike={:.2} text={}",
+                        cid, strike, raw
+                    );
+                    break;
+                }
+            }
+        }
+
+        if !strike_cache.contains_key(&cid)
+            && config.fair_value_enabled
+            && config.oracle_enabled
+            && config.strike_capture_window_s > 0.0
+        {
+            if let Some(start_epoch_utc) = update.start_epoch_utc {
+                let age_s = update.received_at - (start_epoch_utc as f64);
+                let window_s = config.strike_capture_window_s.max(0.0);
+                if age_s.is_finite() && age_s >= 0.0 && age_s <= window_s {
+                    if let Some(sym) = infer_underlying_symbol(&update) {
+                        if let Some(spot) =
+                            oracle::get_price(&oracle_store, &sym, config.oracle_price_ttl_s).await
+                        {
+                            strike_cache.insert(cid.clone(), spot);
+                            debug!(
+                                "Captured strike from oracle: condition={} sym={} strike={:.2} age_s={:.1}",
+                                cid, sym, spot, age_s
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         if config.min_book_depth_usdc > 0.0 {
@@ -107,7 +159,12 @@ pub async fn run(
             let target = config.arb_max_entry_exit_cost;
             let current_cost = pos.leg_1_entry_price + opp_ask;
 
-            if target > 0.0 && current_cost <= target {
+            let break_even_opp_price = 1.0 - pos.leg_1_entry_price;
+            let profit_locking_threshold = break_even_opp_price - 0.01;
+            let should_close = (target > 0.0 && current_cost <= target)
+                || (profit_locking_threshold.is_finite() && opp_ask <= profit_locking_threshold);
+
+            if should_close {
                 let marked = position_manager
                     .with_position_mut(&cid, |p| {
                         if p.leg_2_pending || !p.leg_1_filled {
@@ -150,6 +207,134 @@ pub async fn run(
                 });
                 tasks_by_condition.insert(cid_key, handle);
                 continue;
+            }
+
+            // Risk: stop-loss on leg1 mark-to-market (directional exposure while unhedged).
+            let stop_loss_pct = config.leg1_stop_loss_pct.max(0.0);
+            if stop_loss_pct > 0.0 && pos.leg_1_entry_price > 0.0 && leg1_bid_ref > 0.0 {
+                let pnl_pct = (leg1_bid_ref - pos.leg_1_entry_price) / pos.leg_1_entry_price;
+                if pnl_pct.is_finite() && pnl_pct <= -stop_loss_pct {
+                    warn!(
+                        "STOP_LOSS: condition={} pnl_pct={:.4} entry={:.4} bid={:.4} threshold=-{:.4}. Unwinding.",
+                        cid, pnl_pct, pos.leg_1_entry_price, leg1_bid_ref, stop_loss_pct
+                    );
+
+                    let marked_unwind = position_manager
+                        .with_position_mut(&cid, |p| {
+                            if p.unwind_pending || p.leg_2_pending {
+                                return false;
+                            }
+                            p.unwind_pending = true;
+                            p.state = PositionState::Unwinding;
+                            true
+                        })
+                        .unwrap_or(false);
+
+                    if marked_unwind {
+                        let cid_key = cid.clone();
+                        let cid_for_task = cid_key.clone();
+                        let exec_cl = exec.clone();
+                        let cfg_cl = Arc::clone(&config);
+                        let st_cl = Arc::clone(&state);
+                        let pos_mgr_cl = Arc::clone(&position_manager);
+
+                        let (outcome_to_sell, token_to_sell, exit_price_ref) = if leg1_is_yes {
+                            ("YES".to_string(), pos.yes_token_id.clone(), update.yes.best_bid)
+                        } else {
+                            ("NO".to_string(), pos.no_token_id.clone(), update.no.best_bid)
+                        };
+
+                        let size_to_sell = pos.leg_1_size;
+
+                        let handle = tokio::spawn(async move {
+                            match run_paper_unwind(
+                                exec_cl,
+                                st_cl,
+                                cfg_cl,
+                                pos_mgr_cl,
+                                cid_for_task.clone(),
+                                outcome_to_sell,
+                                token_to_sell,
+                                size_to_sell,
+                                exit_price_ref,
+                            )
+                            .await
+                            {
+                                Ok(_) => info!("Unwind success for {}", cid_for_task),
+                                Err(e) => warn!("Unwind failed for {}: {e:#}", cid_for_task),
+                            }
+                        });
+                        tasks_by_condition.insert(cid_key, handle);
+                    }
+
+                    continue;
+                }
+            }
+
+            // Risk: never go into settlement unhedged (avoid "gambling" at expiry).
+            let force_unwind_remaining_s = config.force_unwind_time_remaining_s.max(0.0);
+            if force_unwind_remaining_s > 0.0 && config.market_window_minutes > 0 {
+                if let Some(start_epoch_utc) = update.start_epoch_utc {
+                    let end_epoch_utc =
+                        (start_epoch_utc as f64) + (config.market_window_minutes as f64) * 60.0;
+                    let remaining_s = end_epoch_utc - update.received_at;
+                    if remaining_s.is_finite() && remaining_s >= 0.0 && remaining_s <= force_unwind_remaining_s {
+                        warn!(
+                            "NEAR_EXPIRY: condition={} remaining_s={:.1} <= {:.1}. Unwinding.",
+                            cid, remaining_s, force_unwind_remaining_s
+                        );
+
+                        let marked_unwind = position_manager
+                            .with_position_mut(&cid, |p| {
+                                if p.unwind_pending || p.leg_2_pending {
+                                    return false;
+                                }
+                                p.unwind_pending = true;
+                                p.state = PositionState::Unwinding;
+                                true
+                            })
+                            .unwrap_or(false);
+
+                        if marked_unwind {
+                            let cid_key = cid.clone();
+                            let cid_for_task = cid_key.clone();
+                            let exec_cl = exec.clone();
+                            let cfg_cl = Arc::clone(&config);
+                            let st_cl = Arc::clone(&state);
+                            let pos_mgr_cl = Arc::clone(&position_manager);
+
+                            let (outcome_to_sell, token_to_sell, exit_price_ref) = if leg1_is_yes {
+                                ("YES".to_string(), pos.yes_token_id.clone(), update.yes.best_bid)
+                            } else {
+                                ("NO".to_string(), pos.no_token_id.clone(), update.no.best_bid)
+                            };
+
+                            let size_to_sell = pos.leg_1_size;
+
+                            let handle = tokio::spawn(async move {
+                                match run_paper_unwind(
+                                    exec_cl,
+                                    st_cl,
+                                    cfg_cl,
+                                    pos_mgr_cl,
+                                    cid_for_task.clone(),
+                                    outcome_to_sell,
+                                    token_to_sell,
+                                    size_to_sell,
+                                    exit_price_ref,
+                                )
+                                .await
+                                {
+                                    Ok(_) => info!("Unwind success for {}", cid_for_task),
+                                    Err(e) => warn!("Unwind failed for {}: {e:#}", cid_for_task),
+                                }
+                            });
+                            tasks_by_condition.insert(cid_key, handle);
+                        }
+
+                        continue;
+                    }
+                }
             }
 
             let max_wait_seconds = config.leg1_max_wait_s.max(0.0);
@@ -218,35 +403,157 @@ pub async fn run(
             continue;
         }
 
-        let entry_thr = config.entry_threshold;
-        if !(entry_thr > 0.0) {
-            continue;
+        // Entry selection:
+        // - Prefer "fair value" vs underlying+strike (PDF), otherwise fallback to naive threshold.
+        let mut leg1_outcome: Option<&'static str> = None;
+        let mut leg1_ask_ref: f64 = 0.0;
+        let mut selected_by_fair_value = false;
+
+        if config.fair_value_enabled {
+            let sym = infer_underlying_symbol(&update);
+            let strike = update
+                .strike_price
+                .or_else(|| strike_cache.get(&cid).copied());
+            let tte_s = time_to_expiry_s(&update, &config);
+
+            if let (Some(sym), Some(strike), Some(tte_s)) = (sym, strike, tte_s) {
+                if let Some(spot) =
+                    oracle::get_price(&oracle_store, &sym, config.oracle_price_ttl_s).await
+                {
+                    if let Some(fair_yes) = fair_prob_up(
+                        spot,
+                        strike,
+                        tte_s,
+                        config.fair_value_sigma_annual.max(0.0),
+                    ) {
+                        let fair_no = 1.0 - fair_yes;
+                        let edge_yes = fair_yes - yes_ask;
+                        let edge_no = fair_no - no_ask;
+                        let thr = config.edge_threshold.max(0.0);
+
+                        if edge_yes.is_finite() && edge_yes > thr {
+                            leg1_outcome = Some("YES");
+                            leg1_ask_ref = yes_ask;
+                            selected_by_fair_value = true;
+                        }
+                        if edge_no.is_finite() && edge_no > thr {
+                            if leg1_outcome.is_none()
+                                || (edge_no > edge_yes && edge_yes.is_finite())
+                                || !edge_yes.is_finite()
+                            {
+                                leg1_outcome = Some("NO");
+                                leg1_ask_ref = no_ask;
+                                selected_by_fair_value = true;
+                            }
+                        }
+
+                        if let Some(out) = leg1_outcome {
+                            debug!(
+                                "FAIR_VALUE signal: condition={} sym={} spot={:.2} strike={:.2} tte_s={:.1} fair_yes={:.3} fair_no={:.3} yes_ask={:.3} no_ask={:.3} edge_yes={:.3} edge_no={:.3}",
+                                cid,
+                                sym,
+                                spot,
+                                strike,
+                                tte_s,
+                                fair_yes,
+                                fair_no,
+                                yes_ask,
+                                no_ask,
+                                edge_yes,
+                                edge_no
+                            );
+                            debug!("FAIR_VALUE chose leg1={} ask={:.4}", out, leg1_ask_ref);
+                        }
+                    }
+                }
+            }
         }
 
-        let mut candidates: Vec<(&str, f64)> = Vec::new();
-        if yes_ask <= entry_thr {
-            candidates.push(("YES", yes_ask));
+        if leg1_outcome.is_none() {
+            let entry_thr = config.entry_threshold;
+            if !(entry_thr > 0.0) {
+                continue;
+            }
+
+            let mut candidates: Vec<(&'static str, f64)> = Vec::new();
+            if yes_ask <= entry_thr {
+                candidates.push(("YES", yes_ask));
+            }
+            if no_ask <= entry_thr {
+                candidates.push(("NO", no_ask));
+            }
+            if candidates.is_empty() {
+                continue;
+            }
+            candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let (side, ask_ref) = candidates[0];
+            leg1_outcome = Some(side);
+            leg1_ask_ref = ask_ref;
         }
-        if no_ask <= entry_thr {
-            candidates.push(("NO", no_ask));
-        }
-        if candidates.is_empty() {
+
+        let Some(leg1_outcome) = leg1_outcome else {
             continue;
-        }
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        let (leg1_outcome, leg1_ask_ref) = candidates[0];
+        };
 
         let target_cost = config.arb_max_entry_exit_cost;
         let budget = config.arb_budget_usdc;
         if !(target_cost > 0.0 && budget > 0.0) {
             continue;
         }
-        let shares_target = budget / target_cost;
+
+        let opp_ask_now = if leg1_outcome == "YES" { no_ask } else { yes_ask };
+        let total_cost_now = leg1_ask_ref + opp_ask_now;
+        if !total_cost_now.is_finite() {
+            continue;
+        }
+
+        let is_atomic_arb = total_cost_now <= target_cost + 1e-12;
+        if !is_atomic_arb {
+            let max_leg_in_cost = config.max_leg_in_entry_cost;
+            if selected_by_fair_value && max_leg_in_cost > 0.0 && total_cost_now <= max_leg_in_cost + 1e-12 {
+                debug!(
+                    "Leg-In entry allowed: condition={} total_cost_now={:.4} max_leg_in_cost={:.4} (atomic_target_cost={:.4})",
+                    cid, total_cost_now, max_leg_in_cost, target_cost
+                );
+            } else {
+                debug!(
+                    "Skipping entry: condition={} total_cost_now={:.4} > atomic_target_cost={:.4} (fair_value={} max_leg_in_cost={:.4})",
+                    cid, total_cost_now, target_cost, selected_by_fair_value, max_leg_in_cost
+                );
+                continue;
+            }
+        }
+
+        let sizing_cost = if is_atomic_arb {
+            target_cost
+        } else {
+            config.max_leg_in_entry_cost
+        };
+        if !(sizing_cost.is_finite() && sizing_cost > 0.0) {
+            continue;
+        }
+
+        let shares_target = budget / sizing_cost;
         if !shares_target.is_finite() || shares_target <= 0.0 {
             continue;
         }
 
         let now = update.received_at;
+        if config.entry_min_time_remaining_s > 0.0 && config.market_window_minutes > 0 {
+            if let Some(start_epoch_utc) = update.start_epoch_utc {
+                let end_epoch_utc =
+                    (start_epoch_utc as f64) + (config.market_window_minutes as f64) * 60.0;
+                let remaining_s = end_epoch_utc - now;
+                if remaining_s.is_finite() && remaining_s <= config.entry_min_time_remaining_s {
+                    debug!(
+                        "Skipping entry: condition={} near expiry (remaining_s={:.1} <= cutoff_s={:.1})",
+                        cid, remaining_s, config.entry_min_time_remaining_s
+                    );
+                    continue;
+                }
+            }
+        }
+
         if !entry_allowed(&exec, Arc::clone(&state), &config, &cid, now).await {
             continue;
         }
@@ -357,6 +664,71 @@ async fn cleanup_finished_tasks(tasks: &mut HashMap<String, JoinHandle<()>>) {
             let _ = h.await;
         }
     }
+}
+
+fn time_to_expiry_s(update: &MarketUpdate, config: &Config) -> Option<f64> {
+    let start_epoch_utc = update.start_epoch_utc?;
+    if config.market_window_minutes == 0 {
+        return None;
+    }
+    let end_epoch_utc = (start_epoch_utc as f64) + (config.market_window_minutes as f64) * 60.0;
+    let diff = end_epoch_utc - update.received_at;
+    if !diff.is_finite() {
+        return None;
+    }
+    Some(diff.max(0.0))
+}
+
+fn infer_underlying_symbol(update: &MarketUpdate) -> Option<String> {
+    for s in [update.event_slug.as_deref(), update.label.as_deref()] {
+        let Some(sym) = s.and_then(infer_underlying_symbol_from_text) else {
+            continue;
+        };
+        if !sym.is_empty() {
+            return Some(sym);
+        }
+    }
+    None
+}
+
+fn infer_underlying_symbol_from_text(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let head = s
+        .split(|c: char| c == '-' || c == '_' || c == ' ')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if head.is_empty() {
+        return None;
+    }
+
+    let sym = match head.as_str() {
+        "btc" | "bitcoin" => "BTC",
+        "eth" | "ethereum" => "ETH",
+        "sol" | "solana" => "SOL",
+        "xrp" => "XRP",
+        other => other,
+    };
+    Some(sym.to_ascii_uppercase())
+}
+
+fn infer_strike_from_slug(slug: &str) -> Option<f64> {
+    let parts: Vec<&str> = slug.split('-').collect();
+    for window in parts.windows(2) {
+        let keyword = window[0];
+        if keyword.eq_ignore_ascii_case("above") || keyword.eq_ignore_ascii_case("below") {
+            if let Ok(val) = window[1].parse::<f64>() {
+                if val.is_finite() && val > 0.0 {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
 }
 
 async fn entry_allowed(
@@ -686,22 +1058,42 @@ async fn run_paper_leg2_and_merge(
         .await?;
 
     if leg2.filled_shares <= 0.0 {
-        let sell = exec
-            .paper_sell(
-                now_s(),
-                &cid,
-                &leg1_outcome,
-                &leg1_token_id,
-                pos.leg_1_size,
-                leg1_bid_ref,
-                pos.leg_1_entry_price,
-                "UNWIND_LEG1",
-            )
-            .await?;
+        // In leg-in mode, a failed leg2 should not automatically unwind leg1 unless we cannot fund it.
+        let required = (pos.leg_1_size * leg2_ask_ref).max(0.0);
+        let bal = exec.paper_balance().await;
+        if bal + 1e-12 < required {
+            warn!(
+                "Leg2 failed and insufficient funds: condition={} need={:.4} balance={:.4}; unwinding leg1",
+                cid, required, bal
+            );
+            let sell = exec
+                .paper_sell(
+                    now_s(),
+                    &cid,
+                    &leg1_outcome,
+                    &leg1_token_id,
+                    pos.leg_1_size,
+                    leg1_bid_ref,
+                    pos.leg_1_entry_price,
+                    "UNWIND_LEG1",
+                )
+                .await?;
 
-        let pnl = (sell.vwap_price - pos.leg_1_entry_price) * sell.filled_shares;
-        finish_paper_trade(Arc::clone(&state), &config, &cid, pnl, now_s()).await;
-        position_manager.close_position(&cid);
+            let pnl = (sell.vwap_price - pos.leg_1_entry_price) * sell.filled_shares;
+            finish_paper_trade(Arc::clone(&state), &config, &cid, pnl, now_s()).await;
+            position_manager.close_position(&cid);
+            return Ok(());
+        }
+
+        warn!(
+            "Leg2 failed but funds available: condition={} keeping leg1 open and retrying",
+            cid
+        );
+        let _ = position_manager.with_position_mut(&cid, |p| {
+            p.leg_2_pending = false;
+            p.leg_2_entry_price = None;
+            p.state = PositionState::Holding;
+        });
         return Ok(());
     }
 

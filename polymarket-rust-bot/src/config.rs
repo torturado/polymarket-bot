@@ -12,6 +12,8 @@ pub struct Config {
     pub ws_subscribe_message: Option<Value>,
     pub market_specs_path: PathBuf,
     pub market_refresh_interval_s: u64,
+    pub market_window_minutes: u64,
+    pub entry_min_time_remaining_s: f64,
 
     pub paper_trading: bool,
     pub paper_trades_log: PathBuf,
@@ -48,6 +50,23 @@ pub struct Config {
     pub burst_log_slices_in_paper: bool,
     pub burst_simulate_fok_by_depth: bool,
     pub burst_consume_book_in_paper: bool,
+
+    // Underlying oracle (external price feed)
+    pub oracle_enabled: bool,
+    pub oracle_ws_url: String,
+    pub oracle_symbols: Vec<String>,
+    pub oracle_price_ttl_s: f64,
+
+    // Fair value model (probability vs strike + time)
+    pub fair_value_enabled: bool,
+    pub edge_threshold: f64,
+    pub fair_value_sigma_annual: f64,
+    pub strike_capture_window_s: f64,
+    pub max_leg_in_entry_cost: f64,
+
+    // Per-position risk (unhedged leg1)
+    pub leg1_stop_loss_pct: f64,
+    pub force_unwind_time_remaining_s: f64,
 }
 
 impl Config {
@@ -62,6 +81,8 @@ impl Config {
         let market_specs_path =
             resolve_market_specs_path(std::env::var("MARKET_SPECS_FILE").ok().as_deref());
         let market_refresh_interval_s = parse_u64_env("MARKET_REFRESH_INTERVAL_S", 0)?;
+        let market_window_minutes = parse_u64_env("MARKET_WINDOW_MINUTES", 0)?;
+        let entry_min_time_remaining_s = parse_f64_env("ENTRY_MIN_TIME_REMAINING_S", 300.0)?;
 
         let paper_trading = parse_bool_env("PAPER_TRADING", true);
         let paper_trades_log = PathBuf::from(parse_string_env(
@@ -103,6 +124,24 @@ impl Config {
         let burst_simulate_fok_by_depth = parse_bool_env("BURST_SIMULATE_FOK_BY_DEPTH", false);
         let burst_consume_book_in_paper = parse_bool_env("BURST_CONSUME_BOOK_IN_PAPER", true);
 
+        let oracle_enabled = parse_bool_env("ORACLE_ENABLED", false);
+        let oracle_ws_url = parse_string_env("ORACLE_WS_URL", "");
+        let oracle_symbols = parse_string_list_env(
+            "ORACLE_SYMBOLS",
+            vec!["BTC".to_string(), "ETH".to_string(), "SOL".to_string(), "XRP".to_string()],
+        )?;
+        let oracle_price_ttl_s = parse_f64_env("ORACLE_PRICE_TTL_S", 10.0)?;
+
+        let fair_value_enabled = parse_bool_env("FAIR_VALUE_ENABLED", true);
+        let edge_threshold = parse_f64_env("EDGE_THRESHOLD", 0.02)?;
+        let fair_value_sigma_annual = parse_f64_env("FAIR_VALUE_SIGMA_ANNUAL", 0.8)?;
+        let strike_capture_window_s = parse_f64_env("STRIKE_CAPTURE_WINDOW_S", 10.0)?;
+        let max_leg_in_entry_cost = parse_f64_env("MAX_LEG_IN_ENTRY_COST", 1.02)?;
+
+        let leg1_stop_loss_pct = parse_f64_env("LEG1_STOP_LOSS_PCT", 0.0)?;
+        let force_unwind_time_remaining_s =
+            parse_f64_env("FORCE_UNWIND_TIME_REMAINING_S", 60.0)?;
+
         Ok(Self {
             ws_url,
             ws_headers,
@@ -110,6 +149,8 @@ impl Config {
             ws_subscribe_message,
             market_specs_path,
             market_refresh_interval_s,
+            market_window_minutes,
+            entry_min_time_remaining_s,
             paper_trading,
             paper_trades_log,
             paper_initial_balance,
@@ -141,6 +182,17 @@ impl Config {
             burst_log_slices_in_paper,
             burst_simulate_fok_by_depth,
             burst_consume_book_in_paper,
+            oracle_enabled,
+            oracle_ws_url,
+            oracle_symbols,
+            oracle_price_ttl_s,
+            fair_value_enabled,
+            edge_threshold,
+            fair_value_sigma_annual,
+            strike_capture_window_s,
+            max_leg_in_entry_cost,
+            leg1_stop_loss_pct,
+            force_unwind_time_remaining_s,
         })
     }
 }
@@ -269,6 +321,50 @@ fn parse_json_value_env(name: &str) -> Result<Option<Value>> {
             Ok(None)
         }
     }
+}
+
+fn parse_string_list_env(name: &str, default: Vec<String>) -> Result<Vec<String>> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(default);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(default);
+    }
+
+    if raw.starts_with('[') {
+        if let Ok(v) = serde_json::from_str::<Value>(raw) {
+            if let Some(arr) = v.as_array() {
+                let mut out = Vec::with_capacity(arr.len());
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        let sym = s.trim().to_ascii_uppercase();
+                        if !sym.is_empty() {
+                            out.push(sym);
+                        }
+                    } else if item.is_number() || item.is_boolean() {
+                        let sym = item.to_string().trim().to_ascii_uppercase();
+                        if !sym.is_empty() {
+                            out.push(sym);
+                        }
+                    }
+                }
+                if !out.is_empty() {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let sym = part.trim().to_ascii_uppercase();
+        if sym.is_empty() {
+            continue;
+        }
+        out.push(sym);
+    }
+    Ok(if out.is_empty() { default } else { out })
 }
 
 fn parse_map_like_value(raw: &str) -> HashMap<String, String> {

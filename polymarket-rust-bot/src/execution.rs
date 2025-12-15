@@ -300,6 +300,8 @@ impl ExecutionEngine {
         let mut notional = 0.0;
         let mut sent = 0u32;
         let mut available_left: Option<f64> = None;
+        let mut depth_left_usdc: Option<f64> = None;
+        let order_type = self.config.burst_order_type.trim().to_ascii_uppercase();
 
         while remaining > 0.0 && sent < max_orders {
             let pd = self.get_price(token_id).await;
@@ -352,6 +354,30 @@ impl ExecutionEngine {
                 break;
             }
 
+            if self.config.burst_simulate_fok_by_depth {
+                let depth_now = pd.as_ref().map(|p| p.ask_depth_usdc).unwrap_or(0.0);
+                if depth_now > 0.0 && price > 0.0 {
+                    depth_left_usdc = Some(depth_left_usdc.unwrap_or(depth_now).min(depth_now));
+
+                    let max_shares_by_depth = depth_left_usdc.unwrap() / price;
+                    if max_shares_by_depth <= 0.0 {
+                        break;
+                    }
+
+                    if order_type == "FOK" {
+                        if slice_shares > max_shares_by_depth + 1e-12 {
+                            break;
+                        }
+                    } else {
+                        slice_shares = slice_shares.min(max_shares_by_depth);
+                    }
+                }
+            }
+
+            if slice_shares <= 0.0 {
+                break;
+            }
+
             // Simulate paying per slice (more realistic if price moves).
             let slice_cost = price * slice_shares;
             if !self.wallet.debit(slice_cost).await {
@@ -365,6 +391,11 @@ impl ExecutionEngine {
 
             if let Some(left) = available_left.as_mut() {
                 *left = (*left - slice_shares).max(0.0);
+            }
+            if self.config.burst_simulate_fok_by_depth && self.config.burst_consume_book_in_paper {
+                if let Some(left) = depth_left_usdc.as_mut() {
+                    *left = (*left - slice_cost).max(0.0);
+                }
             }
 
             if self.config.burst_log_slices_in_paper {

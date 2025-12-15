@@ -1,7 +1,9 @@
 mod config;
 mod execution;
+mod fair_value;
 mod market_specs;
 mod monitor;
+mod oracle;
 mod paper;
 mod position_manager;
 mod strategy;
@@ -37,6 +39,15 @@ async fn main() -> Result<()> {
     let position_manager = Arc::new(position_manager::PositionManager::new());
     let monitor_positions = Arc::clone(&position_manager);
 
+    let oracle_store = oracle::new_store();
+    let oracle_cfg = Arc::clone(&config);
+    let oracle_store_task = Arc::clone(&oracle_store);
+    tokio::spawn(async move {
+        if let Err(e) = oracle::run_oracle_loop(oracle_cfg, oracle_store_task).await {
+            warn!("oracle stopped: {e:#}");
+        }
+    });
+
     let watcher_cfg = Arc::clone(&config);
     tokio::spawn(async move {
         if let Err(e) = monitor::run_market_specs_watcher(watcher_cfg, spec_tx).await {
@@ -50,7 +61,7 @@ async fn main() -> Result<()> {
             warn!("WS monitor stopped: {e:#}");
         }
     });
-    strategy::run(rx, strategy_cfg, position_manager).await?;
+    strategy::run(rx, strategy_cfg, position_manager, oracle_store).await?;
 
     Ok(())
 }

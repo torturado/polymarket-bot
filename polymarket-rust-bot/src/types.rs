@@ -12,6 +12,8 @@ pub struct MarketSpec {
     pub event_slug: Option<String>,
     #[serde(default)]
     pub start_epoch_utc: Option<i64>,
+    #[serde(default)]
+    pub strike_price: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +31,10 @@ pub struct MarketUpdate {
     pub condition_id: String,
     pub yes_token_id: String,
     pub no_token_id: String,
+    pub start_epoch_utc: Option<i64>,
+    pub strike_price: Option<f64>,
+    pub label: Option<String>,
+    pub event_slug: Option<String>,
     pub yes: PriceData,
     pub no: PriceData,
     pub received_at: f64,
