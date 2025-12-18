@@ -1,164 +1,58 @@
-# Polymarket BTC Up/Down Paper-Trading Bot
+Polymarket leg‑in bot (MVP)
 
-A Python paper-trading bot that simulates the Polymarket BTC 15-minute up/down trading strategy. The bot watches for opportunities where buying both sides of a market (UP and DOWN) costs less than $1.00, creating a near-risk-free arbitrage opportunity.
+**Qué hay aquí**
+- `src/leg_in_bot.py`: orquestador del bot.
+- `src/market_monitor.py`: monitor WS CLOB con best_bid/best_ask.
+- `update_market_specs.py`: actualiza `market_specs.json` periódicamente.
 
-## Strategy Overview
-
-The bot implements a simple but effective strategy:
-
-1. **Monitor BTC 15-minute markets**: Watches for Bitcoin up/down markets with 15-minute durations
-2. **Detect arbitrage opportunities**: When `price_up + price_down < threshold` (default: 0.99), enter a position
-3. **Buy both sides**: Purchase equal dollar amounts of UP and DOWN shares
-4. **Hold to resolution**: Wait for market resolution and collect guaranteed payout
-
-### Example Trade
-
--   Buy UP at 23 cents
--   Buy DOWN at 70 cents
--   Total cost: 93 cents
--   Guaranteed payout: 100 cents
--   Profit: 7 cents (7% return)
-
-## Installation
-
-1. **Clone or download this repository**
-
-2. **Install dependencies**:
-
+**1) Instalación**
 ```bash
-pip install -r requirements.txt
+python -m venv venv
+venv/bin/pip install -r requirements.txt
 ```
 
-**Note**: The bot uses the official `py-clob-client` SDK from Polymarket. Make sure it's installed correctly.
+**2) Configuración**
+Edita `.env` (mira `.env.example`). Imprescindible:
+- `USE_WEBSOCKET=true`
+- `MARKET_SPECS_FILE=market_specs.json`
+- `MARKET_REFRESH_INTERVAL_S=30` (o similar)
+- `MARKET_SOURCE=gamma_15m` (para mercados 15m por Gamma API)
+- `MARKET_FILTER_REGEX` si quieres filtrar, ej. `(?i)xrp-updown-15m-\\d+`.
+- `MARKET_FILTER_CURRENT_WINDOW=true` para quedarte solo con la ventana 15m actual (ET).
+- Para evitar loops de re‑entry: `MAX_ENTRIES_PER_CONDITION`, `REENTRY_COOLDOWN_S`, `ENTRY_SIGNAL_MIN_INTERVAL_MS`.
+- Para filtrar entradas “muertas”: `MAX_OPPOSITE_ASK_FOR_ENTRY` (o alias `NO_ENTRY_IF_EITHER_ASK_ABOVE`), y `MAX_ENTRY_EXIT_COST` (recomendado 1.00–1.01).
+- Protección extra de iliquidez: `MAX_ENTRY_SIDE_SPREAD` (si `ask - bid` de la pata supera esto, no entra).
+- Filtros conservadores extra: `MIN_OPPOSITE_ASK`, `MIN_BOOK_DEPTH_USDC`, `MIN_SPREAD_BASIS_POINTS` (requiere book snapshots del WS).
+- Circuit breaker: `MAX_DAILY_LOSS` (bloquea nuevas entradas hasta el próximo día UTC).
+- `MAX_POSITION_SIZE` se interpreta como presupuesto USDC por patita (`size = budget / price`).
+- `POLYMARKET_WS_HEADERS` / `POLYMARKET_WS_COOKIES` se pasan como JSON (mira `.env.example`).
 
-## Configuration
-
-### API Credentials (Polymarket Builder)
-
-The bot supports Polymarket Builder API credentials (apiKey, secret, and passphrase).
-
-**Option 1: Using `.env` file (Recommended)**
-
-A `.env` file has been created with your Builder credentials. The bot will automatically load them from environment variables.
-
-If you need to update credentials, edit `.env`:
-
+**3) Auto‑actualizar markets**
+Este script consulta Gamma API (tag `15M`) y escribe `market_specs.json` cada 15m (por defecto).
 ```bash
-POLYMARKET_API_KEY=your_api_key_here
-POLYMARKET_API_SECRET=your_api_secret_here
-POLYMARKET_PASSPHRASE=your_passphrase_here
+venv/bin/python update_market_specs.py
 ```
+Opciones útiles:
+- `--once` actualiza una vez y sale.
+- `--interval 900` cambia el periodo.
+- `--source gamma_15m` fuerza Gamma (si no usas `.env`).
+- `--filter-regex "(?i)xrp-updown-15m-\\d+"` override rápido.
 
-**Option 2: Direct configuration in `config.py`**
-
-You can also set credentials directly:
-
-```python
-config = BotConfig(
-    api_key="your_api_key_here",
-    api_secret="your_api_secret_here",
-    passphrase="your_passphrase_here"
-)
-```
-
-**Security Note**: The `.env` file is already in `.gitignore` and will not be committed to git. Keep your credentials secure!
-
-### Bot Parameters
-
-Edit `config.py` to customize bot behavior:
-
--   `entry_threshold`: Combined price threshold (default: 0.99)
--   `max_capital`: Maximum capital to deploy (default: $10,000)
--   `max_position_size`: Maximum position size per pair (default: $100)
--   `max_concurrent_pairs`: Maximum concurrent positions (default: 10)
--   `trading_fee_percent`: Trading fee percentage (default: 2%)
--   `polling_interval_seconds`: How often to check markets (default: 5 seconds)
--   `market_keywords`: Keywords to filter BTC markets (default: ["BTC", "Bitcoin", "15m", "15 min"])
-
-## Usage
-
-Run the paper-trading bot:
-
+**4) Ejecutar el bot**
 ```bash
-python main.py run-paper-bot
+venv/bin/python src/leg_in_bot.py
 ```
 
-The bot will:
-
--   Fetch BTC 15-minute up/down markets from Polymarket
--   Monitor prices and identify entry opportunities
--   Simulate trades (no real orders are placed)
--   Track positions and PnL
--   Log trades to console and CSV (`paper_trades.csv`)
--   Generate a final report on shutdown (`final_report.json`)
-
-## Important Notes
-
-### API Configuration
-
-The bot includes placeholder implementations for Polymarket API endpoints. You'll need to:
-
-1. **Update API endpoints** in `config.py` if Polymarket's API structure differs
-2. **Adapt GraphQL queries** in `polymarket_client.py` to match Polymarket's actual API schema
-3. **Test API connectivity** before running the bot
-
-The current implementation uses example GraphQL queries that may need adjustment based on Polymarket's actual API documentation.
-
-### Paper Trading Only
-
-**This bot does NOT place real orders.** It simulates trades for strategy testing and analysis. To use with real trading:
-
-1. Implement order execution in a separate module
-2. Add authentication/API keys for Polymarket
-3. Thoroughly test with small amounts first
-4. Understand the risks involved
-
-### Edge Cases Handled
-
--   Insufficient capital
--   Maximum concurrent positions limit
--   Market resolution detection
--   Fee calculations
--   Illiquid markets (missing quotes)
-
-## Project Structure
-
+**5) Dashboard (UI web)**
+Lanza el bot + una UI en localhost (tablas de mercados/posiciones y feed de eventos):
+```bash
+venv/bin/python src/dashboard.py
 ```
-.
-├── config.py              # Bot configuration
-├── models.py              # Data models (Market, Position, Quote, etc.)
-├── polymarket_client.py   # API client for fetching market data
-├── strategy.py            # Trading strategy logic
-├── engine.py              # Main simulation engine
-├── reporting.py           # Logging and CSV reporting
-├── main.py                # CLI entrypoint
-├── requirements.txt       # Python dependencies
-└── README.md              # This file
-```
+Abre `http://127.0.0.1:8000` (ajusta `DASHBOARD_HOST/DASHBOARD_PORT` en `.env` si quieres).
 
-## Output Files
+Notas:
+- El subscribe al WS se genera automáticamente a partir de `market_specs.json`.
+- `merge_tokens()` para live trading sigue pendiente (stub).
 
--   `paper_trades.csv`: Log of all trades with timestamps, prices, sizes, and PnL
--   `final_report.json`: Final summary with all positions and PnL history
-
-## Future Enhancements
-
--   Real order execution (requires Polymarket API integration)
--   Backtesting on historical data
--   Early exit strategies (exit when combined price widens)
--   WebSocket support for real-time price updates
--   Database persistence for positions and history
--   Advanced risk management (position sizing based on edge)
-
-## Disclaimer
-
-This bot is for educational and research purposes. Trading on prediction markets involves risk. Always:
-
--   Test thoroughly before using real capital
--   Understand the markets and strategy
--   Monitor positions actively
--   Use appropriate risk management
-
-## License
-
-This project is provided as-is for educational purposes.
+Paper trading:
+- `PAPER_INITIAL_BALANCE` controla el saldo inicial de la billetera virtual (el bot bloquea nuevas entradas si no alcanza).
